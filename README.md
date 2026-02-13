@@ -1,42 +1,57 @@
-# EGX Intraday Scanner
+Alright Sir.
+Clean. Professional. No password mention. No over-details. Just solid.
 
-# 
+Copy this into README.md.
 
-# Personal intraday volume-spike scanner for EGX30.
+EGX Intraday Scanner
 
-# 
+A focused intraday volume-spike scanner for EGX30 stocks built with Streamlit.
 
-# Features:
+The application scans a predefined watchlist, ranks candidates by relative volume expansion, builds structured trade levels, and generates AI-assisted trade commentary.
 
-# 
+Features
 
-# 5m volume spike detection (vs 20 SMA)
+5-minute intraday data
 
-# 
+Volume spike detection (vs 20-bar SMA)
 
-# Entry / Stop / T1 / T2 / T3 auto levels
+Automatic Entry / Stop / T1 / T2 / T3 levels
 
-# 
+Top 10 ranked candidates
 
-# Top 10 ranking
+Turnover-based prioritization
 
-# 
+Live vs stale session detection
 
-# AI picks (2 names)
+AI-generated structured trade recommendations
 
-# 
+Clean bucket classification:
 
-# Optional password protection
+✅ Strong (≥ 3×)
 
-# 
+⚠️ Watchlist (2–3×)
 
-# Run
+👀 Warm (< 2×)
 
-# python -m venv .venv
+Strategy Logic
 
-# .venv\\Scripts\\activate
+Spike Ratio
 
-# pip install -r requirements.txt
+Last Completed Bar Volume / SMA(Volume, 20)
 
-# python -m streamlit run app.py
 
+Risk Model
+
+R = Entry − Stop
+T1 = Entry + 1R
+T2 = Entry + 2R
+T3 = Entry + 3R
+
+
+Ranking prioritizes:
+
+Bucket strength
+
+Spike ratio magnitude
+
+Turnover (EGP)
