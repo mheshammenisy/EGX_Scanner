@@ -16,7 +16,23 @@ from egx_watchlist import EGX_SAFE_INTRADAY, display_name
 from egx_scan_once import ensure_ohlcv, filter_last_minutes  # must exist in your scanner file
 from openai import OpenAI
 
+APP_PASSWORD = os.getenv("APP_PASSWORD") or st.secrets.get("APP_PASSWORD", "")
 
+if APP_PASSWORD:
+    if "auth_ok" not in st.session_state:
+        st.session_state["auth_ok"] = False
+
+    if not st.session_state["auth_ok"]:
+        st.title("🔒 Private App")
+        pw = st.text_input("Password", type="password")
+
+        if st.button("Login"):
+            if pw == APP_PASSWORD:
+                st.session_state["auth_ok"] = True
+                st.rerun()
+            else:
+                st.error("Wrong password.")
+        st.stop()
 # -----------------------------
 # Fixed defaults (no user inputs)
 # -----------------------------
@@ -32,6 +48,10 @@ LAST_MINUTES = 90
 # Buckets
 STRONG_HIT = 3.0      # >= 3
 WATCHLIST_LOW = 2.0   # 2 to 3
+
+# -----------------------------
+# Simple password gate (Streamlit secrets / env)
+# -----------------------------
 
 
 st.set_page_config(page_title="EGX Intraday Scanner", layout="wide")
