@@ -1,0 +1,6 @@
+.venv/ 
+.streamlit/ 
+__pycache__/ 
+data/ 
+draft/ 
+*.pyc 
