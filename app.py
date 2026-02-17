@@ -1,3 +1,4 @@
+# app.py
 import os
 import re
 import json
@@ -9,14 +10,17 @@ import numpy as np
 import pandas as pd
 import streamlit as st
 import yfinance as yf
-
 import matplotlib.pyplot as plt
 
 from egx_watchlist import EGX_SAFE_INTRADAY, display_name
-from egx_scan_once import ensure_ohlcv, filter_last_minutes  # must exist in your scanner file
+from egx_scan_once import ensure_ohlcv, filter_last_minutes
 from openai import OpenAI
 
-APP_PASSWORD = os.getenv("APP_PASSWORD") or st.secrets.get("APP_PASSWORD", "")
+
+# -----------------------------
+# Simple password gate (Secrets first)
+# -----------------------------
+APP_PASSWORD = st.secrets.get("APP_PASSWORD", os.getenv("APP_PASSWORD", ""))
 
 if APP_PASSWORD:
     if "auth_ok" not in st.session_state:
@@ -33,6 +37,8 @@ if APP_PASSWORD:
             else:
                 st.error("Wrong password.")
         st.stop()
+
+
 # -----------------------------
 # Fixed defaults (no user inputs)
 # -----------------------------
@@ -41,26 +47,29 @@ PERIOD = "5d"
 VOL_LOOKBACK = 20
 TOP_N = 10
 
-# Freshness window (for mode detection only).
-# With Yahoo delays + market open, 60–90 is safer than 30.
+# Freshness window (for mode detection only)
 LAST_MINUTES = 90
 
-# Buckets
-STRONG_HIT = 3.0      # >= 3
+# Buckets (based on impulse spike ratio)
+STRONG_HIT = 2.5     # >= 2.5
 WATCHLIST_LOW = 2.0   # 2 to 3
 
-# -----------------------------
-# Simple password gate (Streamlit secrets / env)
-# -----------------------------
+# Second-leg / delay-proof setup parameters
+RECENT_BARS = 6          # find impulse within last N completed bars (6 bars = 30 min on 5m)
+IMPULSE_SPIKE_MIN = 2.0  # EGX: start at 2.0 (3.0 misses too much)
+PULLBACK_MIN = 0.30      # 30% retrace
+PULLBACK_MAX = 0.60      # 60% retrace
+RETRACE_REJECT = 0.70    # reject if pullback >70% of impulse range
 
 
 st.set_page_config(page_title="EGX Intraday Scanner", layout="wide")
 st.title("EGX Intraday Scanner (Always Shows Top 10)")
 
 st.caption(
-    f"Defaults: interval={INTERVAL}, period={PERIOD}, freshness_window={LAST_MINUTES}m, lookback={VOL_LOOKBACK} bars. "
-    f"Buckets: ✅≥{STRONG_HIT}× | ⚠️ {WATCHLIST_LOW}–{STRONG_HIT}× | 👀 <{WATCHLIST_LOW}×. "
-    "Nothing runs automatically — click Run Scan."
+    f"Defaults: interval={INTERVAL}, period={PERIOD}, freshness_window={LAST_MINUTES}m, "
+    f"vol_SMA={VOL_LOOKBACK} bars. "
+    f"Impulse buckets: ✅≥{STRONG_HIT}× | ⚠️ {WATCHLIST_LOW}–{STRONG_HIT}× | 👀 <{WATCHLIST_LOW}×. "
+    f"Second-leg: impulse in last {RECENT_BARS} bars + pullback 30–60%."
 )
 
 
@@ -84,6 +93,9 @@ def fetch_intraday(ticker: str) -> pd.DataFrame:
         return pd.DataFrame()
 
 
+# -----------------------------
+# Labels / ranking helpers
+# -----------------------------
 def bucket_label(r: float) -> str:
     if pd.isna(r):
         return "—"
@@ -104,6 +116,21 @@ def bucket_rank(r: float) -> int:
     return 2
 
 
+def state_rank(s: str) -> int:
+    order = {
+        "IN_PULLBACK_ZONE": 0,
+        "PULLING_BACK": 1,
+        "WAIT_PULLBACK": 2,
+        "—": 50,
+        "REJECT_DEEP": 80,
+        "CHASED": 90,
+    }
+    return order.get(str(s), 60)
+
+
+# -----------------------------
+# Metrics
+# -----------------------------
 def compute_turnover_egp(df: pd.DataFrame, bars: int = 78) -> float:
     df = ensure_ohlcv(df)
     if df.empty:
@@ -112,49 +139,115 @@ def compute_turnover_egp(df: pd.DataFrame, bars: int = 78) -> float:
     return float((tail["Close"] * tail["Volume"]).sum())
 
 
-def compute_spike_ratio(df: pd.DataFrame) -> float:
+def compute_recent_impulse(df: pd.DataFrame) -> dict:
     """
-    spike_ratio = last completed bar volume / SMA(volume, lookback)
-    Use FULL df so SMA has enough bars (VOL_LOOKBACK * 5 minutes).
+    Delay-proof impulse detection:
+    Find strongest impulse bar inside last RECENT_BARS completed bars.
+    Impulse: spike_ratio >= IMPULSE_SPIKE_MIN vs SMA(VOL_LOOKBACK)
     """
     df = ensure_ohlcv(df)
-    if df.empty or len(df) < VOL_LOOKBACK + 2:
-        return float("nan")
+    if df.empty or len(df) < VOL_LOOKBACK + RECENT_BARS + 2:
+        return {
+            "impulse_found": False,
+            "impulse_time": "",
+            "impulse_spike": float("nan"),
+            "impulse_high": float("nan"),
+            "impulse_low": float("nan"),
+            "impulse_close": float("nan"),
+        }
 
     work = df.copy()
     work["vol_sma"] = work["Volume"].rolling(VOL_LOOKBACK, min_periods=VOL_LOOKBACK).mean()
+    work["spike_ratio"] = work["Volume"] / work["vol_sma"]
 
-    idx = -2 if len(work) >= 3 else -1  # last completed bar when possible
-    v = work["Volume"].iloc[idx]
-    sma = work["vol_sma"].iloc[idx]
+    end = -2 if len(work) >= 3 else -1
+    start = end - RECENT_BARS + 1
 
-    if pd.isna(sma) or sma <= 0:
-        return float("nan")
-    return float(v / sma)
+    window = work.iloc[start:end + 1].dropna(subset=["spike_ratio"])
+    window = window[window["spike_ratio"] >= IMPULSE_SPIKE_MIN]
+
+    if window.empty:
+        return {
+            "impulse_found": False,
+            "impulse_time": "",
+            "impulse_spike": float("nan"),
+            "impulse_high": float("nan"),
+            "impulse_low": float("nan"),
+            "impulse_close": float("nan"),
+        }
+
+    best_idx = window["spike_ratio"].idxmax()
+    bar = work.loc[best_idx]
+
+    return {
+        "impulse_found": True,
+        "impulse_time": str(best_idx),
+        "impulse_spike": float(bar["spike_ratio"]),
+        "impulse_high": float(bar["High"]),
+        "impulse_low": float(bar["Low"]),
+        "impulse_close": float(bar["Close"]),
+    }
 
 
-def build_levels_from_last_bar(df: pd.DataFrame) -> dict:
-    """
-    entry = last completed bar high (small buffer)
-    stop  = last completed bar low
-    targets = 1R/2R/3R
-    """
+def compute_pullback_zone(imp_high: float, imp_low: float) -> dict:
+    if np.isnan(imp_high) or np.isnan(imp_low):
+        return {"pb_low": float("nan"), "pb_high": float("nan"), "imp_range": float("nan")}
+    rng = imp_high - imp_low
+    if rng <= 0:
+        return {"pb_low": float("nan"), "pb_high": float("nan"), "imp_range": float("nan")}
+
+    pb_high = imp_high - PULLBACK_MIN * rng  # 30% retrace from high
+    pb_low = imp_high - PULLBACK_MAX * rng   # 60% retrace from high
+    return {"pb_low": float(pb_low), "pb_high": float(pb_high), "imp_range": float(rng)}
+
+
+def setup_state(df: pd.DataFrame, *, imp_high: float, imp_low: float, pb_low: float, pb_high: float) -> str:
     df = ensure_ohlcv(df)
-    if df.empty:
+    if df.empty or np.isnan(imp_high) or np.isnan(imp_low) or np.isnan(pb_low) or np.isnan(pb_high):
+        return "—"
+
+    last = float(df["Close"].iloc[-1])
+    rng = imp_high - imp_low
+    if rng <= 0:
+        return "—"
+
+    # too extended above impulse high => you missed it
+    if last > imp_high * 1.01:
+        return "CHASED"
+
+    retr = (imp_high - last) / rng  # 0 at high, 1 at low
+    if retr > RETRACE_REJECT:
+        return "REJECT_DEEP"
+
+    if pb_low <= last <= pb_high:
+        return "IN_PULLBACK_ZONE"
+
+    if last > pb_high:
+        return "WAIT_PULLBACK"
+
+    return "PULLING_BACK"
+
+
+def build_levels_from_impulse(*, pb_low: float, pb_high: float) -> dict:
+    """
+    Second-leg friendly levels:
+    - entry: top of pullback zone with tiny buffer
+    - stop: bottom of pullback zone
+    - targets: 1R/2R/3R
+    """
+    if np.isnan(pb_low) or np.isnan(pb_high) or pb_low >= pb_high:
         return {}
-
-    idx = -2 if len(df) >= 3 else -1
-    bar = df.iloc[idx]
-
-    entry = float(bar["High"]) * 1.0005
-    stop = float(bar["Low"])
+    entry = pb_high * 1.0005
+    stop = pb_low
     if stop >= entry:
         return {}
-
     R = entry - stop
     return {"entry": entry, "stop": stop, "t1": entry + R, "t2": entry + 2 * R, "t3": entry + 3 * R}
 
 
+# -----------------------------
+# Visual
+# -----------------------------
 def plot_levels_ladder(row: pd.Series):
     entry, stop, t1, t2, t3 = row["entry"], row["stop"], row["t1"], row["t2"], row["t3"]
     last_price = row["last_price"]
@@ -162,13 +255,14 @@ def plot_levels_ladder(row: pd.Series):
     symbol = row["symbol"]
     bucket = row["bucket"]
     ratio = row["spike_ratio"]
+    state = row.get("setup_state", "—")
 
     vals = [stop, entry, t1, t2, t3]
     labels = ["STOP", "ENTRY", "T1", "T2", "T3"]
 
     fig, ax = plt.subplots(figsize=(9, 2.1))
     title_ratio = "n/a" if pd.isna(ratio) else f"{ratio:.2f}×"
-    ax.set_title(f"{bucket} | {name} — {symbol} | spike {title_ratio}", fontsize=11)
+    ax.set_title(f"{bucket} | {state} | {name} — {symbol} | impulse {title_ratio}", fontsize=11)
 
     ax.scatter(vals, [0] * len(vals), s=70)
     for v, lab in zip(vals, labels):
@@ -214,11 +308,26 @@ if run_btn:
             any_recent = True
             recent_ok += 1
 
-        ratio = compute_spike_ratio(df_full)
+        imp = compute_recent_impulse(df_full)
+
+        imp_found = bool(imp["impulse_found"])
+        imp_spike = imp["impulse_spike"]
+        imp_high = imp["impulse_high"]
+        imp_low = imp["impulse_low"]
+        imp_time = imp["impulse_time"]
+
+        pb = compute_pullback_zone(imp_high, imp_low)
+        pb_low = pb["pb_low"]
+        pb_high = pb["pb_high"]
+
+        state = setup_state(df_full, imp_high=imp_high, imp_low=imp_low, pb_low=pb_low, pb_high=pb_high)
+
+        # Use impulse spike for bucket + ranking (delay-proof)
+        ratio = imp_spike
         turnover = compute_turnover_egp(df_full)
         last_price = float(df_full["Close"].iloc[-1])
 
-        levels = build_levels_from_last_bar(df_full)
+        levels = build_levels_from_impulse(pb_low=pb_low, pb_high=pb_high)
         entry = levels.get("entry", float("nan"))
         stop = levels.get("stop", float("nan"))
         t1 = levels.get("t1", float("nan"))
@@ -228,16 +337,29 @@ if run_btn:
         rows.append({
             "bucket": bucket_label(ratio),
             "bucket_rank": bucket_rank(ratio),
+            "setup_state": state,
+            "state_rank": state_rank(state),
+
             "name": display_name(t),
             "symbol": t,
+
             "spike_ratio": ratio,
             "turnover_egp": turnover,
             "last_price": last_price,
+
+            "impulse_found": bool(imp_found),
+            "impulse_time": imp_time,
+            "impulse_high": imp_high,
+            "impulse_low": imp_low,
+            "pb_low": pb_low,
+            "pb_high": pb_high,
+
             "entry": entry,
             "stop": stop,
             "t1": t1,
             "t2": t2,
             "t3": t3,
+
             "live": bool(is_recent),
             "last_bar_time": str(df_full.index[-1]),
         })
@@ -247,8 +369,8 @@ if run_btn:
 
     if not ranked.empty:
         ranked = ranked.sort_values(
-            ["bucket_rank", "spike_ratio", "turnover_egp"],
-            ascending=[True, False, False],
+            ["bucket_rank", "state_rank", "spike_ratio", "turnover_egp"],
+            ascending=[True, True, False, False],
         ).reset_index(drop=True)
 
     st.session_state["ranked"] = ranked
@@ -288,19 +410,24 @@ if ranked.empty:
 # -----------------------------
 top = ranked.head(TOP_N).copy()
 
-top["stop_%"] = (top["stop"] / top["entry"] - 1.0) * 100.0
-top["t1_%"] = (top["t1"] / top["entry"] - 1.0) * 100.0
-top["t2_%"] = (top["t2"] / top["entry"] - 1.0) * 100.0
-top["t3_%"] = (top["t3"] / top["entry"] - 1.0) * 100.0
+# avoid divide-by-zero warnings
+top["stop_%"] = np.where(np.isfinite(top["entry"]), (top["stop"] / top["entry"] - 1.0) * 100.0, np.nan)
+top["t1_%"] = np.where(np.isfinite(top["entry"]), (top["t1"] / top["entry"] - 1.0) * 100.0, np.nan)
+top["t2_%"] = np.where(np.isfinite(top["entry"]), (top["t2"] / top["entry"] - 1.0) * 100.0, np.nan)
+top["t3_%"] = np.where(np.isfinite(top["entry"]), (top["t3"] / top["entry"] - 1.0) * 100.0, np.nan)
 
-st.subheader(f"Top {TOP_N} (bucket order: ≥3 then 2–3 then <2)")
+st.subheader(f"Top {TOP_N} (bucket + setup state)")
 
 st.dataframe(
     top[
-        ["bucket", "live", "last_bar_time", "name", "symbol",
-         "spike_ratio", "turnover_egp", "last_price",
-         "entry", "stop", "t1", "t2", "t3",
-         "stop_%", "t1_%", "t2_%", "t3_%"]
+        [
+            "bucket", "setup_state", "live", "last_bar_time", "impulse_time",
+            "name", "symbol",
+            "spike_ratio", "turnover_egp", "last_price",
+            "pb_low", "pb_high",
+            "entry", "stop", "t1", "t2", "t3",
+            "stop_%", "t1_%", "t2_%", "t3_%"
+        ]
     ],
     use_container_width=True,
     hide_index=True,
@@ -320,10 +447,10 @@ c2.metric("⚠️ Watchlist (2–3)", len(watch))
 c3.metric("👀 Warm (<2)", len(warm))
 
 with st.expander("✅ Strong (≥3)"):
-    st.dataframe(strong.drop(columns=["bucket_rank"]), use_container_width=True, hide_index=True) if not strong.empty else st.info("No strong spikes right now.")
+    st.dataframe(strong.drop(columns=["bucket_rank"]), use_container_width=True, hide_index=True) if not strong.empty else st.info("No strong impulses right now.")
 with st.expander("⚠️ Watchlist (2–3)"):
-    st.dataframe(watch.drop(columns=["bucket_rank"]), use_container_width=True, hide_index=True) if not watch.empty else st.info("No medium spikes right now.")
-with st.expander("👀 Warm (no spike)"):
+    st.dataframe(watch.drop(columns=["bucket_rank"]), use_container_width=True, hide_index=True) if not watch.empty else st.info("No medium impulses right now.")
+with st.expander("👀 Warm (no impulse)"):
     st.dataframe(warm.drop(columns=["bucket_rank"]), use_container_width=True, hide_index=True) if not warm.empty else st.info("No warm names right now (rare).")
 
 
@@ -339,7 +466,7 @@ ai_btn = st.button("Ask AI to recommend (Top 10)")
 if ai_btn:
     api_key = os.getenv("OPENAI_API_KEY") or st.secrets.get("OPENAI_API_KEY", "")
     if not api_key:
-        st.error("OPENAI_API_KEY not found. Put it in .streamlit/secrets.toml (not GitHub).")
+        st.error("OPENAI_API_KEY not found. Put it in Streamlit Secrets.")
         st.stop()
 
     client = OpenAI(api_key=api_key)
@@ -348,42 +475,59 @@ if ai_btn:
     for _, r in top.iterrows():
         payload.append({
             "bucket": r["bucket"],
+            "setup_state": r.get("setup_state", "—"),
             "live": bool(r["live"]),
             "last_bar_time": r["last_bar_time"],
+            "impulse_time": r.get("impulse_time", ""),
+
             "name": r["name"],
             "symbol": r["symbol"],
-            "spike_ratio": None if pd.isna(r["spike_ratio"]) else float(r["spike_ratio"]),
+
+            "impulse_spike_ratio": None if pd.isna(r["spike_ratio"]) else float(r["spike_ratio"]),
             "turnover_egp": float(r["turnover_egp"]),
             "last_price": float(r["last_price"]),
+
+            "pb_low": None if pd.isna(r.get("pb_low", np.nan)) else float(r["pb_low"]),
+            "pb_high": None if pd.isna(r.get("pb_high", np.nan)) else float(r["pb_high"]),
+
             "entry": None if pd.isna(r["entry"]) else float(r["entry"]),
             "stop": None if pd.isna(r["stop"]) else float(r["stop"]),
             "t1": None if pd.isna(r["t1"]) else float(r["t1"]),
             "t2": None if pd.isna(r["t2"]) else float(r["t2"]),
             "t3": None if pd.isna(r["t3"]) else float(r["t3"]),
+
             "stop_pct": None if pd.isna(r["stop_%"]) else float(r["stop_%"]),
             "t1_pct": None if pd.isna(r["t1_%"]) else float(r["t1_%"]),
             "t2_pct": None if pd.isna(r["t2_%"]) else float(r["t2_%"]),
             "t3_pct": None if pd.isna(r["t3_%"]) else float(r["t3_%"]),
         })
+
     allowed = ", ".join(top["name"].astype(str).str.upper().tolist())
 
     instruction = f"""
 You are an EGX intraday trading assistant.
 You are given Top {TOP_N} ranked candidates from EGX30.
 
-Ranking is bucket-based:
-1) ✅ Strong (spike_ratio >= {STRONG_HIT})
+These candidates are ranked by:
+- impulse_spike_ratio (volume spike vs SMA{VOL_LOOKBACK})
+- turnover_egp
+- setup_state priority: IN_PULLBACK_ZONE is best for second-leg entries.
+
+Buckets:
+1) ✅ Strong (impulse_spike_ratio >= {STRONG_HIT})
 2) ⚠️ Watchlist ({WATCHLIST_LOW} to {STRONG_HIT})
 3) 👀 Warm (below {WATCHLIST_LOW})
 
 Context:
 - Data can be delayed. Each row includes 'live' and 'last_bar_time'.
+- The strategy is second-leg: wait for pullback into pb_low..pb_high and then continuation.
 - If live=False, say it's STALE and be conservative.
 
 Scoring guidance:
-- Prefer higher spike_ratio AND higher turnover_egp.
+- Prefer setup_state = IN_PULLBACK_ZONE first, then PULLING_BACK, then WAIT_PULLBACK.
+- Prefer higher impulse_spike_ratio AND higher turnover_egp.
 - Penalize chasing: if last_price > entry by more than 0.30%, recommend WAIT or SKIP.
-- If spike_ratio is missing, explicitly state SPIKE UNKNOWN.
+- If impulse_spike_ratio is missing, explicitly state IMPULSE UNKNOWN.
 
 Return ONLY:
 PICK: exactly 2 items, ONLY from this allowed list:
@@ -397,7 +541,7 @@ Use ONLY the short codes above.
 For each pick:
 
 - ACTION: BUY NOW / WAIT / SKIP
-- WHY: 3-5 bullets (must reference spike_ratio or say SPIKE UNKNOWN)
+- WHY: 3-5 bullets (must reference impulse_spike_ratio or say IMPULSE UNKNOWN)
 - LEVELS: Entry, Stop, T1, T2, T3 with % to each
 - NOTE: one caution line
 Then list remaining tickers with one-line reason each.
@@ -427,12 +571,11 @@ No JSON, no code.
 
             # fallback: match Yahoo symbol if AI used it
             if hit.empty:
-              hit = top[
-                  top["symbol"].astype(str).str.upper().str.replace("$", "") == p_clean
-             ]
+                hit = top[top["symbol"].astype(str).str.upper().str.replace("$", "", regex=False) == p_clean]
 
             if hit.empty:
                 continue
+
             plot_levels_ladder(hit.iloc[0])
             shown += 1
 
