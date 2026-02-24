@@ -62,56 +62,6 @@ def last_completed_bar_index(df: pd.DataFrame) -> int:
     return -2 if len(df) >= 3 else -1
 
 
-def find_recent_impulse(
-    df: pd.DataFrame,
-    *,
-    vol_lookback: int = 20,
-    recent_bars: int = 6,
-    spike_min: float = 2.0,
-) -> Optional[dict]:
-    """
-    Detect an impulse that happened RECENTLY (last `recent_bars` completed bars),
-    not only on the last bar. This is delay-proof.
-
-    Returns:
-      {"time": <index>, "spike_ratio": float, "high": float, "low": float}
-    """
-    df = ensure_ohlcv(df)
-    if df.empty:
-        return None
-
-    # Need enough history for SMA + a window + completed bar
-    if len(df) < vol_lookback + recent_bars + 2:
-        return None
-
-    work = df.copy()
-    work["vol_sma"] = work["Volume"].rolling(vol_lookback, min_periods=vol_lookback).mean()
-    work["spike_ratio"] = work["Volume"] / work["vol_sma"]
-
-    end = last_completed_bar_index(work)  # usually -2
-    start = end - recent_bars + 1
-
-    window = work.iloc[start : end + 1].copy()
-    window = window.dropna(subset=["spike_ratio"])
-    if window.empty:
-        return None
-
-    window = window[window["spike_ratio"] >= spike_min]
-    if window.empty:
-        return None
-
-    # Pick the strongest impulse in the window
-    best_time = window["spike_ratio"].idxmax()
-    bar = work.loc[best_time]
-
-    return {
-        "time": best_time,
-        "spike_ratio": float(bar["spike_ratio"]),
-        "high": float(bar["High"]),
-        "low": float(bar["Low"]),
-    }
-
-
 def compute_turnover_egp(df: pd.DataFrame, bars: int = 78) -> float:
     if df.empty:
         return 0.0
@@ -126,7 +76,7 @@ def cairo_now() -> pd.Timestamp:
 def filter_last_minutes(df: pd.DataFrame, *, minutes: int) -> pd.DataFrame:
     """
     Keep only rows inside the last N minutes (Cairo time).
-    Used by the Streamlit app.
+    Used by the Streamlit app / freshness gate for CLI.
     """
     if df.empty:
         return df
@@ -144,12 +94,116 @@ def filter_last_minutes(df: pd.DataFrame, *, minutes: int) -> pd.DataFrame:
 
 
 # -----------------------------
+# Detection: 2 types
+# -----------------------------
+def find_recent_signal(
+    df: pd.DataFrame,
+    *,
+    vol_lookback: int = 20,
+    recent_bars: int = 6,
+    # Type (1): Volume spike
+    spike_min: float = 2.5,
+    # Type (2): Range expansion breakout
+    price_window: int = 4,          # look at last 4 completed bars inside the recent window
+    min_move_pct: float = 0.02,     # >= 2% move
+    vol_confirm_mult: float = 1.3,  # volume >= 1.3x SMA confirms price move
+) -> Optional[dict]:
+    """
+    Delay-proof detection within last `recent_bars` completed bars.
+
+    Priority:
+    1) Volume Spike (>= spike_min * vol_sma)
+    2) Price Expansion (>= min_move_pct) + mild volume confirm (>= vol_confirm_mult * vol_sma)
+
+    Returns dict:
+      {
+        "type": "VOLUME_SPIKE" | "PRICE_EXPANSION",
+        "time": index,
+        "spike_ratio": float,
+        "high": float,
+        "low": float,
+      }
+    """
+    df = ensure_ohlcv(df)
+    if df.empty:
+        return None
+
+    need = vol_lookback + recent_bars + 2
+    if len(df) < need:
+        return None
+
+    work = df.copy()
+    work["vol_sma"] = work["Volume"].rolling(vol_lookback, min_periods=vol_lookback).mean()
+    work["spike_ratio"] = work["Volume"] / work["vol_sma"]
+
+    end = last_completed_bar_index(work)  # usually -2
+    start = end - recent_bars + 1
+    window = work.iloc[start : end + 1].copy()
+    window = window.dropna(subset=["spike_ratio", "vol_sma"])
+
+    if window.empty:
+        return None
+
+    # -----------------------------
+    # (1) Volume spike
+    # -----------------------------
+    spikes = window[window["spike_ratio"] >= spike_min]
+    if not spikes.empty:
+        best_time = spikes["spike_ratio"].idxmax()
+        bar = work.loc[best_time]
+        return {
+            "type": "VOLUME_SPIKE",
+            "time": best_time,
+            "spike_ratio": float(bar["spike_ratio"]),
+            "high": float(bar["High"]),
+            "low": float(bar["Low"]),
+        }
+
+    # -----------------------------
+    # (2) Price expansion breakout + mild volume confirmation
+    # -----------------------------
+    # Take last `price_window` completed bars inside that window
+    pw = min(price_window, len(window))
+    last_block = window.tail(pw)
+    if last_block.empty:
+        return None
+
+    block_low = float(last_block["Low"].min())
+    block_high = float(last_block["High"].max())
+    if block_low <= 0:
+        return None
+
+    move_pct = (block_high - block_low) / block_low
+    if move_pct < min_move_pct:
+        return None
+
+    # volume confirmation: at least ONE bar in that block has volume >= vol_confirm_mult * vol_sma
+    vol_ok = (last_block["Volume"] >= vol_confirm_mult * last_block["vol_sma"]).any()
+    if not vol_ok:
+        return None
+
+    # time anchor: use the bar where high == block_high (first occurrence)
+    high_rows = last_block[last_block["High"] == block_high]
+    best_time = high_rows.index[0] if not high_rows.empty else last_block.index[-1]
+    bar = work.loc[best_time]
+
+    return {
+        "type": "PRICE_EXPANSION",
+        "time": best_time,
+        "spike_ratio": float(bar["spike_ratio"]),  # will likely be < spike_min, still useful info
+        "high": float(block_high),
+        "low": float(block_low),
+    }
+
+
+# -----------------------------
 # Trade plan
 # -----------------------------
 @dataclass
 class TradePlan:
     symbol: str
     name: str
+    signal_type: str
     spike_time: pd.Timestamp
     spike_mult: float
     entry: float
@@ -163,18 +217,23 @@ class TradePlan:
     triggered: bool
 
 
-def compute_trade_plan_from_spike(
+def compute_trade_plan_from_signal(
     symbol: str,
     name: str,
     df: pd.DataFrame,
     *,
     vol_lookback: int = 20,
-    spike_mult: float = 3.0,
+    # detection params
+    recent_bars: int = 6,
+    spike_min: float = 2.5,
+    price_window: int = 4,
+    min_move_pct: float = 0.02,
+    vol_confirm_mult: float = 1.3,
+    # plan params
     require_green_bar: bool = True,
     entry_buffer_pct: float = 0.0005,
     atr_n: int = 14,
     stop_buffer_atr: float = 0.25,
-    recent_bars: int = 6,        # NEW: look back window for impulse
 ) -> Optional[TradePlan]:
 
     df = ensure_ohlcv(df)
@@ -186,36 +245,36 @@ def compute_trade_plan_from_spike(
         return None
 
     work = df.copy()
-    work["vol_sma"] = work["Volume"].rolling(vol_lookback, min_periods=vol_lookback).mean()
     work["atr"] = atr(work, n=atr_n)
 
-    # NEW: detect impulse within last N completed bars (delay-proof)
-    imp = find_recent_impulse(
+    sig = find_recent_signal(
         work,
         vol_lookback=vol_lookback,
         recent_bars=recent_bars,
-        spike_min=spike_mult,  # treat spike_mult as minimum spike ratio threshold
+        spike_min=spike_min,
+        price_window=price_window,
+        min_move_pct=min_move_pct,
+        vol_confirm_mult=vol_confirm_mult,
     )
-    if imp is None:
+    if sig is None:
         return None
 
-    spike_time = imp["time"]
+    spike_time = sig["time"]
     bar = work.loc[spike_time]
 
-    if pd.isna(bar["vol_sma"]) or bar["vol_sma"] <= 0 or pd.isna(bar["atr"]):
+    if pd.isna(bar["atr"]):
         return None
 
-    if require_green_bar and not (bar["Close"] > bar["Open"]):
+    # green bar filter only makes sense for the anchor bar we picked
+    if require_green_bar and not (float(bar["Close"]) > float(bar["Open"])):
         return None
 
-    spike_high = float(bar["High"])
-    spike_low = float(bar["Low"])
-    spike_atr = float(bar["atr"])
+    sig_high = float(sig["high"])
+    sig_low = float(sig["low"])
+    sig_atr = float(bar["atr"])
 
-    # NOTE: These are still "first-leg style" levels.
-    # The Streamlit app will implement the full second-leg/pullback logic.
-    entry = spike_high * (1.0 + entry_buffer_pct)
-    stop = spike_low - stop_buffer_atr * spike_atr
+    entry = sig_high * (1.0 + entry_buffer_pct)
+    stop = sig_low - stop_buffer_atr * sig_atr
     if stop >= entry:
         return None
 
@@ -224,8 +283,9 @@ def compute_trade_plan_from_spike(
     return TradePlan(
         symbol=symbol,
         name=name,
+        signal_type=str(sig["type"]),
         spike_time=spike_time,
-        spike_mult=float(imp["spike_ratio"]),
+        spike_mult=float(sig["spike_ratio"]),
         entry=entry,
         stop=stop,
         risk_R=R,
@@ -266,7 +326,13 @@ def scan_once(
     interval: str = "5m",
     period: str = "5d",
     vol_lookback: int = 20,
-    spike_mult: float = 3.0,
+    # detection tuning
+    spike_min: float = 2.5,
+    recent_bars: int = 6,
+    price_window: int = 4,
+    min_move_pct: float = 0.02,
+    vol_confirm_mult: float = 1.3,
+    # filters
     min_turnover_egp: float = 0.0,
     last_minutes: int = 15,
     require_green_bar: bool = True,
@@ -280,19 +346,22 @@ def scan_once(
         if df.empty:
             continue
 
-        # NEW: only use last_minutes as a freshness gate (do NOT truncate before detection)
+        # freshness gate only (do NOT truncate before detection)
         df_recent = filter_last_minutes(df, minutes=last_minutes)
         if df_recent.empty:
-            continue  # no recent bars => stale/closed
+            continue  # stale / market closed / delayed too far
 
-        plan = compute_trade_plan_from_spike(
+        plan = compute_trade_plan_from_signal(
             sym,
             display_name(sym),
-            df,  # IMPORTANT: full df so we can detect an impulse in last N bars
+            df,  # IMPORTANT: full df for detection
             vol_lookback=vol_lookback,
-            spike_mult=spike_mult,
+            recent_bars=recent_bars,
+            spike_min=spike_min,
+            price_window=price_window,
+            min_move_pct=min_move_pct,
+            vol_confirm_mult=vol_confirm_mult,
             require_green_bar=require_green_bar,
-            recent_bars=6,
         )
         if plan is None:
             continue
@@ -307,3 +376,39 @@ def scan_once(
         return pd.DataFrame()
 
     return pd.DataFrame([p.__dict__ for p in plans])
+
+
+# -----------------------------
+# CLI entrypoint (optional)
+# -----------------------------
+def main():
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--spike_min", type=float, default=2.5)
+    parser.add_argument("--recent_bars", type=int, default=6)
+    parser.add_argument("--price_window", type=int, default=4)
+    parser.add_argument("--min_move_pct", type=float, default=0.02)
+    parser.add_argument("--vol_confirm_mult", type=float, default=1.3)
+    parser.add_argument("--last_minutes", type=int, default=15)
+    args = parser.parse_args()
+
+    df = scan_once(
+        EGX_SAFE_INTRADAY,
+        spike_min=args.spike_min,
+        recent_bars=args.recent_bars,
+        price_window=args.price_window,
+        min_move_pct=args.min_move_pct,
+        vol_confirm_mult=args.vol_confirm_mult,
+        last_minutes=args.last_minutes,
+    )
+
+    if df.empty:
+        print("No hits.")
+    else:
+        # show key columns
+        cols = ["name", "symbol", "signal_type", "spike_time", "spike_mult", "entry", "stop", "t1", "t2", "t3", "turnover_egp"]
+        cols = [c for c in cols if c in df.columns]
+        print(df[cols].sort_values(["signal_type", "spike_mult"], ascending=[True, False]).to_string(index=False))
+
+
+if __name__ == "__main__":
+    main()
