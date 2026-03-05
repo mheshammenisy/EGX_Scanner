@@ -16,6 +16,22 @@ from egx_watchlist import EGX_SAFE_INTRADAY, display_name
 from egx_scan_once import ensure_ohlcv, filter_last_minutes
 from openai import OpenAI
 
+from zoneinfo import ZoneInfo
+
+CAIRO_TZ = ZoneInfo("Africa/Cairo")
+UTC_TZ = ZoneInfo("UTC")
+
+def to_cairo(ts):
+    ts = pd.to_datetime(ts)
+    if ts.tzinfo is None:
+        ts = ts.tz_localize(UTC_TZ)
+    return ts.tz_convert(CAIRO_TZ)
+
+def minutes_delay_from_now(ts):
+    ts_cairo = to_cairo(ts)
+    now_cairo = pd.Timestamp.now(tz=CAIRO_TZ)
+    return int((now_cairo - ts_cairo).total_seconds() / 60)
+
 
 # -----------------------------
 # Page config MUST be first Streamlit call
@@ -335,12 +351,22 @@ def build_levels_from_pullback(*, pb_low: float, pb_high: float) -> dict:
     """
     if np.isnan(pb_low) or np.isnan(pb_high) or pb_low >= pb_high:
         return {}
-    entry = pb_high * 1.0005
-    stop = pb_low
+    entry = pb_high * 1.0001
+    stop = pb_low * 0.998
     if stop >= entry:
         return {}
     R = entry - stop
-    return {"entry": entry, "stop": stop, "t1": entry + R, "t2": entry + 2 * R, "t3": entry + 3 * R}
+    R_cap = min(R, entry * 0.015)  # cap R to 1% of entry to avoid crazy wide levels
+    t1 = entry + 0.8 *R_cap
+    t2 = entry + 1.5 * R_cap
+    t3 = entry + 2.2 * R_cap
+    return {
+        "entry": entry,
+        "stop": stop,
+        "t1": t1,
+        "t2": t2, 
+        "t3": t3
+    }
 
 
 # -----------------------------
