@@ -229,7 +229,7 @@ def compute_recent_signal(df: pd.DataFrame) -> dict:
     Type A: VOLUME_SPIKE
       spike_ratio >= IMPULSE_SPIKE_MIN
 
-    Type B: PRICE_EXPANSION (📈 Breakout)
+    Type B: PRICE_EXPANSION
       (max_high - min_low)/min_low >= MIN_MOVE_PCT within last PRICE_WINDOW bars
       AND at least one bar has Volume >= VOL_CONFIRM_MULT * vol_sma
     """
@@ -339,9 +339,7 @@ def compute_breakout_continuation(df: pd.DataFrame) -> dict:
     work["vol_sma"] = work["Volume"].rolling(VOL_LOOKBACK, min_periods=VOL_LOOKBACK).mean()
 
     end = -2 if len(work) >= 3 else -1
-    bar = work.iloc[end]
-
-    if pd.isna(bar["vol_sma"]):
+    if len(work) < abs(end) + 1:
         return {
             "signal_found": False,
             "signal_type": "—",
@@ -352,8 +350,23 @@ def compute_breakout_continuation(df: pd.DataFrame) -> dict:
             "move_pct": float("nan"),
         }
 
-    base = work.iloc[end - BREAKOUT_LOOKBACK : end]
+    base_start = max(0, end - BREAKOUT_LOOKBACK)
+    base = work.iloc[base_start:end]
+
     if len(base) < BREAKOUT_MIN_BARS:
+        return {
+            "signal_found": False,
+            "signal_type": "—",
+            "signal_time": "",
+            "spike_ratio": float("nan"),
+            "sig_high": float("nan"),
+            "sig_low": float("nan"),
+            "move_pct": float("nan"),
+        }
+
+    bar = work.iloc[end]
+
+    if pd.isna(bar["vol_sma"]):
         return {
             "signal_found": False,
             "signal_type": "—",
@@ -427,7 +440,7 @@ def build_levels_from_pullback(*, pb_low: float, pb_high: float) -> dict:
         return {}
 
     R = entry - stop
-    R_cap = min(R, entry * 0.015)  # cap R to 1.5% of entry to avoid crazy wide levels
+    R_cap = min(R, entry * 0.015)
 
     t1 = entry + 1.0 * R_cap
     t2 = entry + 2.0 * R_cap
@@ -668,7 +681,10 @@ if run_btn:
     }
 
 ranked = st.session_state["ranked"]
-meta = st.session_state.get("meta", {"elapsed": None, "watchlist": len(EGX_SAFE_INTRADAY), "data_ok": 0, "recent_ok": 0})
+meta = st.session_state.get(
+    "meta",
+    {"elapsed": None, "watchlist": len(EGX_SAFE_INTRADAY), "data_ok": 0, "recent_ok": 0},
+)
 mode = st.session_state.get("mode", "—")
 
 m1, m2, m3, m4 = st.columns(4)
@@ -700,23 +716,44 @@ top["t1_%"] = np.where(np.isfinite(top["entry"]), (top["t1"] / top["entry"] - 1.
 top["t2_%"] = np.where(np.isfinite(top["entry"]), (top["t2"] / top["entry"] - 1.0) * 100.0, np.nan)
 top["t3_%"] = np.where(np.isfinite(top["entry"]), (top["t3"] / top["entry"] - 1.0) * 100.0, np.nan)
 top["move_%"] = np.where(np.isfinite(top["move_pct"]), top["move_pct"] * 100.0, np.nan)
-top["remaining_upside_%"] = np.where(np.isfinite(top["remaining_upside_pct"]), top["remaining_upside_pct"] * 100.0, np.nan)
+top["remaining_upside_%"] = np.where(
+    np.isfinite(top["remaining_upside_pct"]),
+    top["remaining_upside_pct"] * 100.0,
+    np.nan,
+)
 
 st.subheader(f"Top {TOP_N} (signal + setup state + liquidity)")
 
+display_cols = [
+    "signal_label",
+    "setup_state",
+    "liquidity",
+    "live",
+    "last_bar_time",
+    "signal_time",
+    "name",
+    "symbol",
+    "spike_ratio",
+    "move_%",
+    "turnover_egp",
+    "last_price",
+    "pb_low",
+    "pb_high",
+    "entry",
+    "stop",
+    "t1",
+    "t2",
+    "t3",
+    "stop_%",
+    "t1_%",
+    "t2_%",
+    "t3_%",
+    "remaining_upside_%",
+]
+display_cols = [c for c in display_cols if c in top.columns]
+
 st.dataframe(
-    top[
-        [
-            "signal_label", "setup_state", "liquidity", "live",
-            "last_bar_time", "signal_time",
-            "name", "symbol",
-            "spike_ratio", "move_%", "turnover_egp", "last_price",
-            "pb_low", "pb_high",
-            "entry", "stop", "t1", "t2", "t3",
-            "stop_%", "t1_%", "t2_%", "t3_%",
-            "remaining_upside_%"
-        ]
-    ],
+    top[display_cols],
     use_container_width=True,
     hide_index=True,
 )
@@ -735,11 +772,22 @@ c2.metric(f"⚠️ Watchlist ({WATCHLIST_LOW}–{STRONG_HIT}×)", len(watch))
 c3.metric(f"👀 Warm (<{WATCHLIST_LOW})", len(warm))
 
 with st.expander(f"✅ Strong (≥{STRONG_HIT}×)"):
-    st.dataframe(strong.drop(columns=["bucket_rank"]), use_container_width=True, hide_index=True) if not strong.empty else st.info("No strong names right now.")
+    if not strong.empty:
+        st.dataframe(strong.drop(columns=["bucket_rank"]), use_container_width=True, hide_index=True)
+    else:
+        st.info("No strong names right now.")
+
 with st.expander(f"⚠️ Watchlist ({WATCHLIST_LOW}–{STRONG_HIT}×)"):
-    st.dataframe(watch.drop(columns=["bucket_rank"]), use_container_width=True, hide_index=True) if not watch.empty else st.info("No medium names right now.")
+    if not watch.empty:
+        st.dataframe(watch.drop(columns=["bucket_rank"]), use_container_width=True, hide_index=True)
+    else:
+        st.info("No medium names right now.")
+
 with st.expander(f"👀 Warm (<{WATCHLIST_LOW}×)"):
-    st.dataframe(warm.drop(columns=["bucket_rank"]), use_container_width=True, hide_index=True) if not warm.empty else st.info("No warm names right now.")
+    if not warm.empty:
+        st.dataframe(warm.drop(columns=["bucket_rank"]), use_container_width=True, hide_index=True)
+    else:
+        st.info("No warm names right now.")
 
 
 # -----------------------------
@@ -767,10 +815,8 @@ if ai_btn:
             "setup_state": r.get("setup_state", "—"),
             "live": bool(r.get("live", False)),
             "last_bar_time": r.get("last_bar_time", ""),
-
             "name": r["name"],
             "symbol": r["symbol"],
-
             "spike_ratio": None if pd.isna(r["spike_ratio"]) else float(r["spike_ratio"]),
             "move_pct": None if pd.isna(r.get("move_pct", np.nan)) else float(r["move_pct"]),
             "turnover_egp": float(r["turnover_egp"]),
@@ -778,16 +824,13 @@ if ai_btn:
             "liquidity_score": int(r.get("liquidity_score", 99)),
             "last_price": float(r["last_price"]),
             "remaining_upside_pct": None if pd.isna(r.get("remaining_upside_pct", np.nan)) else float(r["remaining_upside_pct"]),
-
             "pb_low": None if pd.isna(r.get("pb_low", np.nan)) else float(r["pb_low"]),
             "pb_high": None if pd.isna(r.get("pb_high", np.nan)) else float(r["pb_high"]),
-
             "entry": None if pd.isna(r["entry"]) else float(r["entry"]),
             "stop": None if pd.isna(r["stop"]) else float(r["stop"]),
             "t1": None if pd.isna(r["t1"]) else float(r["t1"]),
             "t2": None if pd.isna(r["t2"]) else float(r["t2"]),
             "t3": None if pd.isna(r["t3"]) else float(r["t3"]),
-
             "stop_pct": None if pd.isna(r["stop_%"]) else float(r["stop_%"]),
             "t1_pct": None if pd.isna(r["t1_%"]) else float(r["t1_%"]),
             "t2_pct": None if pd.isna(r["t2_%"]) else float(r["t2_%"]),
