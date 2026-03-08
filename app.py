@@ -87,6 +87,12 @@ PRICE_WINDOW = 4
 MIN_MOVE_PCT = 0.02
 VOL_CONFIRM_MULT = 1.3
 
+# New breakout-continuation detector
+BREAKOUT_LOOKBACK = 12
+BREAKOUT_BUFFER_PCT = 0.001
+BREAKOUT_MIN_BARS = 3
+BREAKOUT_VOL_MULT = 1.8
+
 MIN_TURNOVER_EGP = 2_000_000
 USE_LIQUIDITY_FILTER = False
 
@@ -100,7 +106,8 @@ st.caption(
     f"vol_SMA={VOL_LOOKBACK} bars. "
     f"Buckets: ✅≥{STRONG_HIT}× | ⚠️ {WATCHLIST_LOW}–{STRONG_HIT}× | 👀 <{WATCHLIST_LOW}×. "
     f"Signals: 🚀 spike (≥{IMPULSE_SPIKE_MIN}× in last {RECENT_BARS}) OR "
-    f"📈 breakout (≥{MIN_MOVE_PCT*100:.0f}% + vol≥{VOL_CONFIRM_MULT}×). "
+    f"📈 breakout (≥{MIN_MOVE_PCT*100:.0f}% + vol≥{VOL_CONFIRM_MULT}×) OR "
+    f"⚡ momentum breakout (local base + breakout + vol≥{BREAKOUT_VOL_MULT}×). "
     f"Second-leg: pullback 30–60%. "
     f"Late filter: chased if >{ENTRY_CHASE_BUFFER_PCT*100:.2f}% above entry or "
     f"<{MIN_REMAINING_UPSIDE_PCT*100:.1f}% upside left to T2."
@@ -153,8 +160,10 @@ def bucket_rank(r: float) -> int:
 def state_rank(s: str) -> int:
     order = {
         "IN_PULLBACK_ZONE": 0,
-        "PULLING_BACK": 1,
-        "WAIT_PULLBACK": 2,
+        "BREAKOUT_READY": 1,
+        "PULLING_BACK": 2,
+        "WAIT_BREAKOUT": 3,
+        "WAIT_PULLBACK": 4,
         "—": 50,
         "REJECT_DEEP": 80,
         "CHASED": 90,
@@ -163,12 +172,20 @@ def state_rank(s: str) -> int:
 
 
 def signal_rank(t: str) -> int:
-    return 0 if t == "VOLUME_SPIKE" else (1 if t == "PRICE_EXPANSION" else 9)
+    if t == "VOLUME_SPIKE":
+        return 0
+    if t == "MOMENTUM_BREAKOUT":
+        return 1
+    if t == "PRICE_EXPANSION":
+        return 2
+    return 9
 
 
 def signal_label(t: str) -> str:
     if t == "VOLUME_SPIKE":
         return "🚀 Spike"
+    if t == "MOMENTUM_BREAKOUT":
+        return "⚡ Momentum Breakout"
     if t == "PRICE_EXPANSION":
         return "📈 Breakout"
     return "—"
@@ -294,6 +311,91 @@ def compute_recent_signal(df: pd.DataFrame) -> dict:
         "sig_high": float("nan"),
         "sig_low": float("nan"),
         "move_pct": float("nan"),
+    }
+
+
+def compute_breakout_continuation(df: pd.DataFrame) -> dict:
+    """
+    Detect momentum continuation without needing a deep pullback.
+
+    Idea:
+    - recent bars build a local base
+    - latest completed bar breaks above recent highs
+    - breakout bar volume confirms
+    """
+    df = ensure_ohlcv(df)
+    if df.empty or len(df) < max(VOL_LOOKBACK + 2, BREAKOUT_LOOKBACK + 3):
+        return {
+            "signal_found": False,
+            "signal_type": "—",
+            "signal_time": "",
+            "spike_ratio": float("nan"),
+            "sig_high": float("nan"),
+            "sig_low": float("nan"),
+            "move_pct": float("nan"),
+        }
+
+    work = df.copy()
+    work["vol_sma"] = work["Volume"].rolling(VOL_LOOKBACK, min_periods=VOL_LOOKBACK).mean()
+
+    end = -2 if len(work) >= 3 else -1
+    bar = work.iloc[end]
+
+    if pd.isna(bar["vol_sma"]):
+        return {
+            "signal_found": False,
+            "signal_type": "—",
+            "signal_time": "",
+            "spike_ratio": float("nan"),
+            "sig_high": float("nan"),
+            "sig_low": float("nan"),
+            "move_pct": float("nan"),
+        }
+
+    base = work.iloc[end - BREAKOUT_LOOKBACK : end]
+    if len(base) < BREAKOUT_MIN_BARS:
+        return {
+            "signal_found": False,
+            "signal_type": "—",
+            "signal_time": "",
+            "spike_ratio": float("nan"),
+            "sig_high": float("nan"),
+            "sig_low": float("nan"),
+            "move_pct": float("nan"),
+        }
+
+    base_high = float(base["High"].max())
+    base_low = float(base["Low"].min())
+    bar_high = float(bar["High"])
+    bar_close = float(bar["Close"])
+
+    broke_out = bar_high >= base_high * (1.0 + BREAKOUT_BUFFER_PCT)
+    vol_ok = float(bar["Volume"]) >= float(bar["vol_sma"]) * BREAKOUT_VOL_MULT
+    green_ok = bar_close > float(bar["Open"])
+
+    if not (broke_out and vol_ok and green_ok):
+        return {
+            "signal_found": False,
+            "signal_type": "—",
+            "signal_time": "",
+            "spike_ratio": float("nan"),
+            "sig_high": float("nan"),
+            "sig_low": float("nan"),
+            "move_pct": float("nan"),
+        }
+
+    move_pct = float("nan")
+    if base_low > 0:
+        move_pct = (bar_high - base_low) / base_low
+
+    return {
+        "signal_found": True,
+        "signal_type": "MOMENTUM_BREAKOUT",
+        "signal_time": str(work.index[end]),
+        "spike_ratio": float(bar["Volume"] / bar["vol_sma"]),
+        "sig_high": float(bar_high),
+        "sig_low": float(base_low),
+        "move_pct": float(move_pct),
     }
 
 
@@ -440,6 +542,8 @@ if run_btn:
             recent_ok += 1
 
         sig = compute_recent_signal(df_full)
+        if not sig["signal_found"]:
+            sig = compute_breakout_continuation(df_full)
 
         sig_type = sig["signal_type"]
         sig_time = sig["signal_time"]
@@ -447,10 +551,6 @@ if run_btn:
         sig_high = sig["sig_high"]
         sig_low = sig["sig_low"]
         move_pct = sig["move_pct"]
-
-        pb = compute_pullback_zone(sig_high, sig_low)
-        pb_low = pb["pb_low"]
-        pb_high = pb["pb_high"]
 
         turnover = compute_turnover_egp(df_full)
         liq = liquidity_label(turnover)
@@ -461,21 +561,47 @@ if run_btn:
 
         last_price = float(df_full["Close"].iloc[-1])
 
-        levels = build_levels_from_pullback(pb_low=pb_low, pb_high=pb_high)
-        entry = levels.get("entry", float("nan"))
-        stop = levels.get("stop", float("nan"))
-        t1 = levels.get("t1", float("nan"))
-        t2 = levels.get("t2", float("nan"))
-        t3 = levels.get("t3", float("nan"))
+        if sig_type == "MOMENTUM_BREAKOUT":
+            pb_low = float("nan")
+            pb_high = float("nan")
 
-        state = setup_state(
-            df_full,
-            sig_high=sig_high,
-            sig_low=sig_low,
-            pb_low=pb_low,
-            pb_high=pb_high,
-            entry=entry,
-        )
+            entry = sig_high * 1.0005
+            stop = sig_low * 0.998
+            if stop >= entry:
+                continue
+
+            R = entry - stop
+            R_cap = min(R, entry * 0.015)
+            t1 = entry + 1.0 * R_cap
+            t2 = entry + 2.0 * R_cap
+            t3 = entry + 3.0 * R_cap
+
+            if last_price > entry * 1.003:
+                state = "CHASED"
+            elif last_price >= sig_high * 0.995:
+                state = "BREAKOUT_READY"
+            else:
+                state = "WAIT_BREAKOUT"
+        else:
+            pb = compute_pullback_zone(sig_high, sig_low)
+            pb_low = pb["pb_low"]
+            pb_high = pb["pb_high"]
+
+            levels = build_levels_from_pullback(pb_low=pb_low, pb_high=pb_high)
+            entry = levels.get("entry", float("nan"))
+            stop = levels.get("stop", float("nan"))
+            t1 = levels.get("t1", float("nan"))
+            t2 = levels.get("t2", float("nan"))
+            t3 = levels.get("t3", float("nan"))
+
+            state = setup_state(
+                df_full,
+                sig_high=sig_high,
+                sig_low=sig_low,
+                pb_low=pb_low,
+                pb_high=pb_high,
+                entry=entry,
+            )
 
         remaining_upside_pct = float("nan")
         if np.isfinite(t2) and last_price > 0:
@@ -604,8 +730,8 @@ watch = ranked[ranked["bucket_rank"] == 1].copy()
 warm = ranked[ranked["bucket_rank"] == 2].copy()
 
 c1, c2, c3 = st.columns(3)
-c1.metric(f"✅ Strong (≥{STRONG_HIT})", len(strong))
-c2.metric(f"⚠️ Watchlist ({WATCHLIST_LOW}–{STRONG_HIT})", len(watch))
+c1.metric(f"✅ Strong (≥{STRONG_HIT}×)", len(strong))
+c2.metric(f"⚠️ Watchlist ({WATCHLIST_LOW}–{STRONG_HIT}×)", len(watch))
 c3.metric(f"👀 Warm (<{WATCHLIST_LOW})", len(warm))
 
 with st.expander(f"✅ Strong (≥{STRONG_HIT}×)"):
@@ -675,22 +801,22 @@ You are an EGX intraday trading assistant.
 You are given Top {TOP_N} ranked candidates from EGX30.
 
 Each candidate includes:
-- signal_type (VOLUME_SPIKE or PRICE_EXPANSION)
-- spike_ratio (volume spike vs SMA{VOL_LOOKBACK}) and/or move_pct (price expansion)
+- signal_type (VOLUME_SPIKE or PRICE_EXPANSION or MOMENTUM_BREAKOUT)
+- spike_ratio (volume spike vs SMA{VOL_LOOKBACK}) and/or move_pct (price expansion / breakout move)
 - turnover_egp (money traded today) and liquidity label (Very High/High/Medium/Low)
-- setup_state (second-leg readiness)
+- setup_state (second-leg readiness or breakout readiness)
 - pullback zone pb_low..pb_high and levels (entry/stop/targets)
 - live + last_bar_time (data freshness)
 - remaining_upside_pct (remaining room to T2)
 
 Strategy:
-- Second-leg entries: wait for pullback into pb_low..pb_high and then continuation.
-- setup_state priority: IN_PULLBACK_ZONE is best, then PULLING_BACK, then WAIT_PULLBACK.
+- Pullback setups: wait for pullback into pb_low..pb_high and then continuation.
+- Breakout setups: breakout readiness matters more than pullback zone.
 
 Scoring guidance (IMPORTANT):
 - Prefer liquidity: ✅ Very High > ✅ High > ⚠️ Medium. Strongly penalize ❌ Low.
-- Prefer setup_state in this order: IN_PULLBACK_ZONE > PULLING_BACK > WAIT_PULLBACK. Avoid CHASED/REJECT_DEEP.
-- Prefer signal_type = VOLUME_SPIKE over PRICE_EXPANSION when both are good.
+- Prefer setup_state in this order: IN_PULLBACK_ZONE > BREAKOUT_READY > PULLING_BACK > WAIT_BREAKOUT > WAIT_PULLBACK. Avoid CHASED/REJECT_DEEP.
+- Prefer signal_type = VOLUME_SPIKE, then MOMENTUM_BREAKOUT, then PRICE_EXPANSION when both are otherwise similar.
 - Prefer higher turnover_egp.
 - Penalize chasing: if last_price > entry by more than 0.30%, recommend WAIT or SKIP.
 - Penalize setups with remaining_upside_pct < {MIN_REMAINING_UPSIDE_PCT:.3f}.

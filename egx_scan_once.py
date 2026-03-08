@@ -27,6 +27,12 @@ RETRACE_REJECT = 0.70        # reject if >70% retrace
 ENTRY_CHASE_BUFFER_PCT = 0.003   # 0.30% above planned entry => chased
 MIN_REMAINING_UPSIDE_PCT = 0.012 # 1.2% to T2 required
 
+# Momentum breakout detection
+BREAKOUT_LOOKBACK = 12
+BREAKOUT_BUFFER_PCT = 0.001
+BREAKOUT_MIN_BARS = 3
+BREAKOUT_VOL_MULT = 1.8
+
 
 # -----------------------------
 # Helpers
@@ -264,6 +270,51 @@ def find_recent_signal(
     }
 
 
+def find_momentum_breakout(df: pd.DataFrame) -> Optional[dict]:
+    """
+    Detect breakout continuation without pullback.
+    """
+    df = ensure_ohlcv(df)
+
+    if len(df) < BREAKOUT_LOOKBACK + 5:
+        return None
+
+    work = df.copy()
+    work["vol_sma"] = work["Volume"].rolling(20).mean()
+
+    end = last_completed_bar_index(work)
+    bar = work.iloc[end]
+
+    if pd.isna(bar["vol_sma"]):
+        return None
+
+    base = work.iloc[end - BREAKOUT_LOOKBACK:end]
+
+    if len(base) < BREAKOUT_MIN_BARS:
+        return None
+
+    base_high = float(base["High"].max())
+    base_low = float(base["Low"].min())
+
+    bar_high = float(bar["High"])
+    bar_close = float(bar["Close"])
+
+    broke_out = bar_high >= base_high * (1 + BREAKOUT_BUFFER_PCT)
+    vol_ok = float(bar["Volume"]) >= float(bar["vol_sma"]) * BREAKOUT_VOL_MULT
+    green_bar = bar_close > float(bar["Open"])
+
+    if not (broke_out and vol_ok and green_bar):
+        return None
+
+    return {
+        "type": "MOMENTUM_BREAKOUT",
+        "time": work.index[end],
+        "spike_ratio": float(bar["Volume"] / bar["vol_sma"]),
+        "high": bar_high,
+        "low": base_low,
+    }
+
+
 # -----------------------------
 # Trade plan
 # -----------------------------
@@ -329,6 +380,10 @@ def compute_trade_plan_from_signal(
         min_move_pct=min_move_pct,
         vol_confirm_mult=vol_confirm_mult,
     )
+
+    if sig is None:
+        sig = find_momentum_breakout(work)
+
     if sig is None:
         return None
 
@@ -343,32 +398,54 @@ def compute_trade_plan_from_signal(
 
     sig_high = float(sig["high"])
     sig_low = float(sig["low"])
-
-    pb = compute_pullback_zone(sig_high, sig_low)
-    pb_low = float(pb["pb_low"])
-    pb_high = float(pb["pb_high"])
-
-    levels = build_levels_from_pullback(pb_low=pb_low, pb_high=pb_high)
-    if not levels:
-        return None
-
-    entry = float(levels["entry"])
-    stop = float(levels["stop"])
-    t1 = float(levels["t1"])
-    t2 = float(levels["t2"])
-    t3 = float(levels["t3"])
-    risk_R = float(levels["risk_R"])
-
     last_price = float(work["Close"].iloc[-1])
 
-    state = setup_state(
-        work,
-        sig_high=sig_high,
-        sig_low=sig_low,
-        pb_low=pb_low,
-        pb_high=pb_high,
-        entry=entry,
-    )
+    if str(sig["type"]) == "MOMENTUM_BREAKOUT":
+        pb_low = float("nan")
+        pb_high = float("nan")
+
+        entry = sig_high * 1.0005
+        stop = sig_low * 0.998
+        if stop >= entry:
+            return None
+
+        risk_R = entry - stop
+        R_cap = min(risk_R, entry * 0.015)
+
+        t1 = entry + 1.0 * R_cap
+        t2 = entry + 2.0 * R_cap
+        t3 = entry + 3.0 * R_cap
+
+        if last_price > entry * 1.003:
+            state = "CHASED"
+        elif last_price >= sig_high * 0.995:
+            state = "BREAKOUT_READY"
+        else:
+            state = "WAIT_BREAKOUT"
+    else:
+        pb = compute_pullback_zone(sig_high, sig_low)
+        pb_low = float(pb["pb_low"])
+        pb_high = float(pb["pb_high"])
+
+        levels = build_levels_from_pullback(pb_low=pb_low, pb_high=pb_high)
+        if not levels:
+            return None
+
+        entry = float(levels["entry"])
+        stop = float(levels["stop"])
+        t1 = float(levels["t1"])
+        t2 = float(levels["t2"])
+        t3 = float(levels["t3"])
+        risk_R = float(levels["risk_R"])
+
+        state = setup_state(
+            work,
+            sig_high=sig_high,
+            sig_low=sig_low,
+            pb_low=pb_low,
+            pb_high=pb_high,
+            entry=entry,
+        )
 
     remaining_upside_pct = float("nan")
     if np.isfinite(t2) and last_price > 0:
@@ -478,15 +555,18 @@ def scan_once(
 
     state_order = {
         "IN_PULLBACK_ZONE": 0,
-        "PULLING_BACK": 1,
-        "WAIT_PULLBACK": 2,
+        "BREAKOUT_READY": 1,
+        "PULLING_BACK": 2,
+        "WAIT_BREAKOUT": 3,
+        "WAIT_PULLBACK": 4,
         "—": 50,
         "REJECT_DEEP": 80,
         "CHASED": 90,
     }
     signal_order = {
         "VOLUME_SPIKE": 0,
-        "PRICE_EXPANSION": 1,
+        "MOMENTUM_BREAKOUT": 1,
+        "PRICE_EXPANSION": 2,
     }
 
     out["state_rank"] = out["setup_state"].map(state_order).fillna(60)
