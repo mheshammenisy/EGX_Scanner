@@ -19,13 +19,22 @@ from egx_watchlist import EGX_SAFE_INTRADAY, display_name
 
 
 # -----------------------------
+# Strategy constants
+# -----------------------------
+PULLBACK_MIN = 0.30          # 30% retrace
+PULLBACK_MAX = 0.60          # 60% retrace
+RETRACE_REJECT = 0.70        # reject if >70% retrace
+ENTRY_CHASE_BUFFER_PCT = 0.003   # 0.30% above planned entry => chased
+MIN_REMAINING_UPSIDE_PCT = 0.012 # 1.2% to T2 required
+
+
+# -----------------------------
 # Helpers
 # -----------------------------
 def ensure_ohlcv(df: pd.DataFrame) -> pd.DataFrame:
     if df is None or df.empty:
         return pd.DataFrame()
 
-    # Drop ticker level if MultiIndex (Field, Ticker)
     if isinstance(df.columns, pd.MultiIndex):
         if df.columns.nlevels == 2 and len(df.columns.levels[1]) == 1:
             df = df.droplevel(1, axis=1)
@@ -93,20 +102,97 @@ def filter_last_minutes(df: pd.DataFrame, *, minutes: int) -> pd.DataFrame:
     return out.loc[out.index >= cutoff]
 
 
+def compute_pullback_zone(sig_high: float, sig_low: float) -> dict:
+    if np.isnan(sig_high) or np.isnan(sig_low):
+        return {"pb_low": float("nan"), "pb_high": float("nan"), "sig_range": float("nan")}
+
+    rng = sig_high - sig_low
+    if rng <= 0:
+        return {"pb_low": float("nan"), "pb_high": float("nan"), "sig_range": float("nan")}
+
+    pb_high = sig_high - PULLBACK_MIN * rng
+    pb_low = sig_high - PULLBACK_MAX * rng
+    return {"pb_low": float(pb_low), "pb_high": float(pb_high), "sig_range": float(rng)}
+
+
+def build_levels_from_pullback(*, pb_low: float, pb_high: float) -> dict:
+    """
+    Second-leg friendly levels:
+    - entry: top of pullback zone with tiny buffer
+    - stop: bottom of pullback zone
+    - targets: 1R / 2R / 3R (capped)
+    """
+    if np.isnan(pb_low) or np.isnan(pb_high) or pb_low >= pb_high:
+        return {}
+
+    entry = pb_high * 1.0001
+    stop = pb_low * 0.998
+    if stop >= entry:
+        return {}
+
+    R = entry - stop
+    R_cap = min(R, entry * 0.015)  # cap R to 1.5% of entry to avoid crazy wide levels
+
+    t1 = entry + 1.0 * R_cap
+    t2 = entry + 2.0 * R_cap
+    t3 = entry + 3.0 * R_cap
+
+    return {
+        "entry": float(entry),
+        "stop": float(stop),
+        "risk_R": float(R),
+        "t1": float(t1),
+        "t2": float(t2),
+        "t3": float(t3),
+    }
+
+
+def setup_state(
+    df: pd.DataFrame,
+    *,
+    sig_high: float,
+    sig_low: float,
+    pb_low: float,
+    pb_high: float,
+    entry: float,
+) -> str:
+    df = ensure_ohlcv(df)
+    if df.empty or np.isnan(sig_high) or np.isnan(sig_low) or np.isnan(pb_low) or np.isnan(pb_high):
+        return "—"
+
+    last = float(df["Close"].iloc[-1])
+    rng = sig_high - sig_low
+    if rng <= 0:
+        return "—"
+
+    if np.isfinite(entry) and last > entry * (1.0 + ENTRY_CHASE_BUFFER_PCT):
+        return "CHASED"
+
+    retr = (sig_high - last) / rng
+    if retr > RETRACE_REJECT:
+        return "REJECT_DEEP"
+
+    if pb_low <= last <= pb_high:
+        return "IN_PULLBACK_ZONE"
+
+    if last > pb_high:
+        return "WAIT_PULLBACK"
+
+    return "PULLING_BACK"
+
+
 # -----------------------------
-# Detection: 2 types
+# Detection
 # -----------------------------
 def find_recent_signal(
     df: pd.DataFrame,
     *,
     vol_lookback: int = 20,
-    recent_bars: int = 6,
-    # Type (1): Volume spike
+    recent_bars: int = 4,
     spike_min: float = 2.5,
-    # Type (2): Range expansion breakout
-    price_window: int = 4,          # look at last 4 completed bars inside the recent window
-    min_move_pct: float = 0.02,     # >= 2% move
-    vol_confirm_mult: float = 1.3,  # volume >= 1.3x SMA confirms price move
+    price_window: int = 4,
+    min_move_pct: float = 0.02,
+    vol_confirm_mult: float = 1.3,
 ) -> Optional[dict]:
     """
     Delay-proof detection within last `recent_bars` completed bars.
@@ -114,15 +200,6 @@ def find_recent_signal(
     Priority:
     1) Volume Spike (>= spike_min * vol_sma)
     2) Price Expansion (>= min_move_pct) + mild volume confirm (>= vol_confirm_mult * vol_sma)
-
-    Returns dict:
-      {
-        "type": "VOLUME_SPIKE" | "PRICE_EXPANSION",
-        "time": index,
-        "spike_ratio": float,
-        "high": float,
-        "low": float,
-      }
     """
     df = ensure_ohlcv(df)
     if df.empty:
@@ -136,7 +213,7 @@ def find_recent_signal(
     work["vol_sma"] = work["Volume"].rolling(vol_lookback, min_periods=vol_lookback).mean()
     work["spike_ratio"] = work["Volume"] / work["vol_sma"]
 
-    end = last_completed_bar_index(work)  # usually -2
+    end = last_completed_bar_index(work)
     start = end - recent_bars + 1
     window = work.iloc[start : end + 1].copy()
     window = window.dropna(subset=["spike_ratio", "vol_sma"])
@@ -144,9 +221,6 @@ def find_recent_signal(
     if window.empty:
         return None
 
-    # -----------------------------
-    # (1) Volume spike
-    # -----------------------------
     spikes = window[window["spike_ratio"] >= spike_min]
     if not spikes.empty:
         best_time = spikes["spike_ratio"].idxmax()
@@ -159,10 +233,6 @@ def find_recent_signal(
             "low": float(bar["Low"]),
         }
 
-    # -----------------------------
-    # (2) Price expansion breakout + mild volume confirmation
-    # -----------------------------
-    # Take last `price_window` completed bars inside that window
     pw = min(price_window, len(window))
     last_block = window.tail(pw)
     if last_block.empty:
@@ -177,12 +247,10 @@ def find_recent_signal(
     if move_pct < min_move_pct:
         return None
 
-    # volume confirmation: at least ONE bar in that block has volume >= vol_confirm_mult * vol_sma
     vol_ok = (last_block["Volume"] >= vol_confirm_mult * last_block["vol_sma"]).any()
     if not vol_ok:
         return None
 
-    # time anchor: use the bar where high == block_high (first occurrence)
     high_rows = last_block[last_block["High"] == block_high]
     best_time = high_rows.index[0] if not high_rows.empty else last_block.index[-1]
     bar = work.loc[best_time]
@@ -190,7 +258,7 @@ def find_recent_signal(
     return {
         "type": "PRICE_EXPANSION",
         "time": best_time,
-        "spike_ratio": float(bar["spike_ratio"]),  # will likely be < spike_min, still useful info
+        "spike_ratio": float(bar["spike_ratio"]),
         "high": float(block_high),
         "low": float(block_low),
     }
@@ -206,14 +274,23 @@ class TradePlan:
     signal_type: str
     spike_time: pd.Timestamp
     spike_mult: float
+    last_price: float
+    turnover_egp: float
+
+    sig_high: float
+    sig_low: float
+    pb_low: float
+    pb_high: float
+
     entry: float
     stop: float
     risk_R: float
     t1: float
     t2: float
     t3: float
-    turnover_egp: float
-    last_price: float
+
+    setup_state: str
+    remaining_upside_pct: float
     triggered: bool
 
 
@@ -223,17 +300,13 @@ def compute_trade_plan_from_signal(
     df: pd.DataFrame,
     *,
     vol_lookback: int = 20,
-    # detection params
-    recent_bars: int = 6,
+    recent_bars: int = 4,
     spike_min: float = 2.5,
     price_window: int = 4,
     min_move_pct: float = 0.02,
     vol_confirm_mult: float = 1.3,
-    # plan params
     require_green_bar: bool = True,
-    entry_buffer_pct: float = 0.0005,
     atr_n: int = 14,
-    stop_buffer_atr: float = 0.25,
 ) -> Optional[TradePlan]:
 
     df = ensure_ohlcv(df)
@@ -265,20 +338,44 @@ def compute_trade_plan_from_signal(
     if pd.isna(bar["atr"]):
         return None
 
-    # green bar filter only makes sense for the anchor bar we picked
     if require_green_bar and not (float(bar["Close"]) > float(bar["Open"])):
         return None
 
     sig_high = float(sig["high"])
     sig_low = float(sig["low"])
-    sig_atr = float(bar["atr"])
 
-    entry = sig_high * (1.0 + entry_buffer_pct)
-    stop = sig_low - stop_buffer_atr * sig_atr
-    if stop >= entry:
+    pb = compute_pullback_zone(sig_high, sig_low)
+    pb_low = float(pb["pb_low"])
+    pb_high = float(pb["pb_high"])
+
+    levels = build_levels_from_pullback(pb_low=pb_low, pb_high=pb_high)
+    if not levels:
         return None
 
-    R = entry - stop
+    entry = float(levels["entry"])
+    stop = float(levels["stop"])
+    t1 = float(levels["t1"])
+    t2 = float(levels["t2"])
+    t3 = float(levels["t3"])
+    risk_R = float(levels["risk_R"])
+
+    last_price = float(work["Close"].iloc[-1])
+
+    state = setup_state(
+        work,
+        sig_high=sig_high,
+        sig_low=sig_low,
+        pb_low=pb_low,
+        pb_high=pb_high,
+        entry=entry,
+    )
+
+    remaining_upside_pct = float("nan")
+    if np.isfinite(t2) and last_price > 0:
+        remaining_upside_pct = (t2 - last_price) / last_price
+
+    if np.isfinite(remaining_upside_pct) and remaining_upside_pct < MIN_REMAINING_UPSIDE_PCT:
+        state = "CHASED"
 
     return TradePlan(
         symbol=symbol,
@@ -286,20 +383,26 @@ def compute_trade_plan_from_signal(
         signal_type=str(sig["type"]),
         spike_time=spike_time,
         spike_mult=float(sig["spike_ratio"]),
+        last_price=last_price,
+        turnover_egp=compute_turnover_egp(work),
+        sig_high=sig_high,
+        sig_low=sig_low,
+        pb_low=pb_low,
+        pb_high=pb_high,
         entry=entry,
         stop=stop,
-        risk_R=R,
-        t1=entry + 1 * R,
-        t2=entry + 2 * R,
-        t3=entry + 3 * R,
-        turnover_egp=compute_turnover_egp(work),
-        last_price=float(work["Close"].iloc[-1]),
-        triggered=False,
+        risk_R=risk_R,
+        t1=t1,
+        t2=t2,
+        t3=t3,
+        setup_state=state,
+        remaining_upside_pct=remaining_upside_pct,
+        triggered=bool(last_price >= entry),
     )
 
 
 # -----------------------------
-# Yahoo fetch (quiet, safe)
+# Yahoo fetch
 # -----------------------------
 def fetch_intraday(symbol: str, interval: str, period: str) -> pd.DataFrame:
     try:
@@ -318,7 +421,7 @@ def fetch_intraday(symbol: str, interval: str, period: str) -> pd.DataFrame:
 
 
 # -----------------------------
-# CLI scan (optional)
+# CLI scan
 # -----------------------------
 def scan_once(
     tickers: list[str],
@@ -326,13 +429,11 @@ def scan_once(
     interval: str = "5m",
     period: str = "5d",
     vol_lookback: int = 20,
-    # detection tuning
     spike_min: float = 2.5,
-    recent_bars: int = 6,
+    recent_bars: int = 4,
     price_window: int = 4,
     min_move_pct: float = 0.02,
     vol_confirm_mult: float = 1.3,
-    # filters
     min_turnover_egp: float = 0.0,
     last_minutes: int = 15,
     require_green_bar: bool = True,
@@ -346,15 +447,14 @@ def scan_once(
         if df.empty:
             continue
 
-        # freshness gate only (do NOT truncate before detection)
         df_recent = filter_last_minutes(df, minutes=last_minutes)
         if df_recent.empty:
-            continue  # stale / market closed / delayed too far
+            continue
 
         plan = compute_trade_plan_from_signal(
             sym,
             display_name(sym),
-            df,  # IMPORTANT: full df for detection
+            df,
             vol_lookback=vol_lookback,
             recent_bars=recent_bars,
             spike_min=spike_min,
@@ -369,22 +469,44 @@ def scan_once(
         if plan.turnover_egp < min_turnover_egp:
             continue
 
-        plan.triggered = plan.last_price >= plan.entry
         plans.append(plan)
 
     if not plans:
         return pd.DataFrame()
 
-    return pd.DataFrame([p.__dict__ for p in plans])
+    out = pd.DataFrame([p.__dict__ for p in plans])
+
+    state_order = {
+        "IN_PULLBACK_ZONE": 0,
+        "PULLING_BACK": 1,
+        "WAIT_PULLBACK": 2,
+        "—": 50,
+        "REJECT_DEEP": 80,
+        "CHASED": 90,
+    }
+    signal_order = {
+        "VOLUME_SPIKE": 0,
+        "PRICE_EXPANSION": 1,
+    }
+
+    out["state_rank"] = out["setup_state"].map(state_order).fillna(60)
+    out["signal_rank"] = out["signal_type"].map(signal_order).fillna(9)
+
+    out = out.sort_values(
+        ["signal_rank", "state_rank", "turnover_egp", "spike_mult"],
+        ascending=[True, True, False, False],
+    ).reset_index(drop=True)
+
+    return out
 
 
 # -----------------------------
-# CLI entrypoint (optional)
+# CLI entrypoint
 # -----------------------------
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--spike_min", type=float, default=2.5)
-    parser.add_argument("--recent_bars", type=int, default=6)
+    parser.add_argument("--recent_bars", type=int, default=4)
     parser.add_argument("--price_window", type=int, default=4)
     parser.add_argument("--min_move_pct", type=float, default=0.02)
     parser.add_argument("--vol_confirm_mult", type=float, default=1.3)
@@ -404,10 +526,26 @@ def main():
     if df.empty:
         print("No hits.")
     else:
-        # show key columns
-        cols = ["name", "symbol", "signal_type", "spike_time", "spike_mult", "entry", "stop", "t1", "t2", "t3", "turnover_egp"]
+        cols = [
+            "name",
+            "symbol",
+            "signal_type",
+            "setup_state",
+            "spike_time",
+            "spike_mult",
+            "last_price",
+            "pb_low",
+            "pb_high",
+            "entry",
+            "stop",
+            "t1",
+            "t2",
+            "t3",
+            "remaining_upside_pct",
+            "turnover_egp",
+        ]
         cols = [c for c in cols if c in df.columns]
-        print(df[cols].sort_values(["signal_type", "spike_mult"], ascending=[True, False]).to_string(index=False))
+        print(df[cols].to_string(index=False))
 
 
 if __name__ == "__main__":

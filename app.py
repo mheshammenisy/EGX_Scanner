@@ -21,11 +21,13 @@ from zoneinfo import ZoneInfo
 CAIRO_TZ = ZoneInfo("Africa/Cairo")
 UTC_TZ = ZoneInfo("UTC")
 
+
 def to_cairo(ts):
     ts = pd.to_datetime(ts)
     if ts.tzinfo is None:
         ts = ts.tz_localize(UTC_TZ)
     return ts.tz_convert(CAIRO_TZ)
+
 
 def minutes_delay_from_now(ts):
     ts_cairo = to_cairo(ts)
@@ -69,33 +71,27 @@ PERIOD = "5d"
 VOL_LOOKBACK = 20
 TOP_N = 10
 
-# Freshness window (for mode detection only)
 LAST_MINUTES = 90
 
-# Buckets (based on spike ratio)
-STRONG_HIT = 2.5      # >= 2.5
-WATCHLIST_LOW = 2.0   # 2.0 to 2.5
+STRONG_HIT = 2.5
+WATCHLIST_LOW = 2.0
 
-# Delay-proof signal window
-RECENT_BARS = 6          # last N completed bars (6 bars = 30 min on 5m)
+RECENT_BARS = 4
+IMPULSE_SPIKE_MIN = 2.0
 
-# Spike signal threshold
-IMPULSE_SPIKE_MIN = 2.0  # spike_ratio >= this
+PULLBACK_MIN = 0.30
+PULLBACK_MAX = 0.60
+RETRACE_REJECT = 0.70
 
-# Pullback zone params (second-leg)
-PULLBACK_MIN = 0.30      # 30% retrace
-PULLBACK_MAX = 0.60      # 60% retrace
-RETRACE_REJECT = 0.70    # reject if >70% retrace (too deep)
+PRICE_WINDOW = 4
+MIN_MOVE_PCT = 0.02
+VOL_CONFIRM_MULT = 1.3
 
-# Breakout (price expansion) parameters (captures gradual moves)
-PRICE_WINDOW = 4          # lookback bars for expansion check (inside recent window)
-MIN_MOVE_PCT = 0.02       # 2% expansion
-VOL_CONFIRM_MULT = 1.3    # at least one bar >= 1.3x vol_sma
+MIN_TURNOVER_EGP = 2_000_000
+USE_LIQUIDITY_FILTER = False
 
-# Liquidity (turnover) labeling + optional filtering
-MIN_TURNOVER_EGP = 2_000_000   # used only if USE_LIQUIDITY_FILTER=True
-USE_LIQUIDITY_FILTER = False   # set True to skip "❌ Low" liquidity names
-
+ENTRY_CHASE_BUFFER_PCT = 0.003
+MIN_REMAINING_UPSIDE_PCT = 0.012
 
 st.title("EGX Intraday Scanner (Always Shows Top 10)")
 
@@ -105,7 +101,9 @@ st.caption(
     f"Buckets: ✅≥{STRONG_HIT}× | ⚠️ {WATCHLIST_LOW}–{STRONG_HIT}× | 👀 <{WATCHLIST_LOW}×. "
     f"Signals: 🚀 spike (≥{IMPULSE_SPIKE_MIN}× in last {RECENT_BARS}) OR "
     f"📈 breakout (≥{MIN_MOVE_PCT*100:.0f}% + vol≥{VOL_CONFIRM_MULT}×). "
-    f"Second-leg: pullback 30–60%. Liquidity: turnover-based labels."
+    f"Second-leg: pullback 30–60%. "
+    f"Late filter: chased if >{ENTRY_CHASE_BUFFER_PCT*100:.2f}% above entry or "
+    f"<{MIN_REMAINING_UPSIDE_PCT*100:.1f}% upside left to T2."
 )
 
 
@@ -165,7 +163,6 @@ def state_rank(s: str) -> int:
 
 
 def signal_rank(t: str) -> int:
-    # Prefer spikes, then breakouts, then none
     return 0 if t == "VOLUME_SPIKE" else (1 if t == "PRICE_EXPANSION" else 9)
 
 
@@ -188,7 +185,6 @@ def liquidity_label(turnover_egp: float) -> str:
 
 
 def liquidity_score(turnover_egp: float) -> int:
-    # lower is better for ranking
     if turnover_egp >= 10_000_000:
         return 0
     if turnover_egp >= 3_000_000:
@@ -205,7 +201,7 @@ def compute_turnover_egp(df: pd.DataFrame, bars: int = 78) -> float:
     df = ensure_ohlcv(df)
     if df.empty:
         return 0.0
-    tail = df.tail(bars)  # ~full EGX session on 5m bars
+    tail = df.tail(bars)
     return float((tail["Close"] * tail["Volume"]).sum())
 
 
@@ -251,7 +247,6 @@ def compute_recent_signal(df: pd.DataFrame) -> dict:
             "move_pct": float("nan"),
         }
 
-    # A) VOLUME SPIKE
     spikes = window[window["spike_ratio"] >= IMPULSE_SPIKE_MIN]
     if not spikes.empty:
         best_idx = spikes["spike_ratio"].idxmax()
@@ -266,7 +261,6 @@ def compute_recent_signal(df: pd.DataFrame) -> dict:
             "move_pct": float("nan"),
         }
 
-    # B) PRICE EXPANSION + mild volume confirm
     pw = min(PRICE_WINDOW, len(window))
     block = window.tail(pw)
     block_low = float(block["Low"].min())
@@ -286,7 +280,7 @@ def compute_recent_signal(df: pd.DataFrame) -> dict:
                 "signal_found": True,
                 "signal_type": "PRICE_EXPANSION",
                 "signal_time": str(best_idx),
-                "spike_ratio": float(bar["spike_ratio"]),  # may be < IMPULSE_SPIKE_MIN
+                "spike_ratio": float(bar["spike_ratio"]),
                 "sig_high": float(block_high),
                 "sig_low": float(block_low),
                 "move_pct": float(move_pct),
@@ -310,12 +304,51 @@ def compute_pullback_zone(sig_high: float, sig_low: float) -> dict:
     if rng <= 0:
         return {"pb_low": float("nan"), "pb_high": float("nan"), "sig_range": float("nan")}
 
-    pb_high = sig_high - PULLBACK_MIN * rng  # 30% retrace from high
-    pb_low = sig_high - PULLBACK_MAX * rng   # 60% retrace from high
+    pb_high = sig_high - PULLBACK_MIN * rng
+    pb_low = sig_high - PULLBACK_MAX * rng
     return {"pb_low": float(pb_low), "pb_high": float(pb_high), "sig_range": float(rng)}
 
 
-def setup_state(df: pd.DataFrame, *, sig_high: float, sig_low: float, pb_low: float, pb_high: float) -> str:
+def build_levels_from_pullback(*, pb_low: float, pb_high: float) -> dict:
+    """
+    Second-leg friendly levels:
+    - entry: top of pullback zone with tiny buffer
+    - stop: bottom of pullback zone
+    - targets: 1R / 2R / 3R
+    """
+    if np.isnan(pb_low) or np.isnan(pb_high) or pb_low >= pb_high:
+        return {}
+
+    entry = pb_high * 1.0001
+    stop = pb_low * 0.998
+    if stop >= entry:
+        return {}
+
+    R = entry - stop
+    R_cap = min(R, entry * 0.015)  # cap R to 1.5% of entry to avoid crazy wide levels
+
+    t1 = entry + 1.0 * R_cap
+    t2 = entry + 2.0 * R_cap
+    t3 = entry + 3.0 * R_cap
+
+    return {
+        "entry": float(entry),
+        "stop": float(stop),
+        "t1": float(t1),
+        "t2": float(t2),
+        "t3": float(t3),
+    }
+
+
+def setup_state(
+    df: pd.DataFrame,
+    *,
+    sig_high: float,
+    sig_low: float,
+    pb_low: float,
+    pb_high: float,
+    entry: float,
+) -> str:
     df = ensure_ohlcv(df)
     if df.empty or np.isnan(sig_high) or np.isnan(sig_low) or np.isnan(pb_low) or np.isnan(pb_high):
         return "—"
@@ -325,11 +358,10 @@ def setup_state(df: pd.DataFrame, *, sig_high: float, sig_low: float, pb_low: fl
     if rng <= 0:
         return "—"
 
-    # too extended above signal high => you missed it
-    if last > sig_high * 1.01:
+    if np.isfinite(entry) and last > entry * (1.0 + ENTRY_CHASE_BUFFER_PCT):
         return "CHASED"
 
-    retr = (sig_high - last) / rng  # 0 at high, 1 at low
+    retr = (sig_high - last) / rng
     if retr > RETRACE_REJECT:
         return "REJECT_DEEP"
 
@@ -340,33 +372,6 @@ def setup_state(df: pd.DataFrame, *, sig_high: float, sig_low: float, pb_low: fl
         return "WAIT_PULLBACK"
 
     return "PULLING_BACK"
-
-
-def build_levels_from_pullback(*, pb_low: float, pb_high: float) -> dict:
-    """
-    Second-leg friendly levels:
-    - entry: top of pullback zone with tiny buffer
-    - stop: bottom of pullback zone
-    - targets: 1R/2R/3R
-    """
-    if np.isnan(pb_low) or np.isnan(pb_high) or pb_low >= pb_high:
-        return {}
-    entry = pb_high * 1.0001
-    stop = pb_low * 0.998
-    if stop >= entry:
-        return {}
-    R = entry - stop
-    R_cap = min(R, entry * 0.015)  # cap R to 1% of entry to avoid crazy wide levels
-    t1 = entry + 0.8 *R_cap
-    t2 = entry + 1.5 * R_cap
-    t3 = entry + 2.2 * R_cap
-    return {
-        "entry": entry,
-        "stop": stop,
-        "t1": t1,
-        "t2": t2, 
-        "t3": t3
-    }
 
 
 # -----------------------------
@@ -447,8 +452,6 @@ if run_btn:
         pb_low = pb["pb_low"]
         pb_high = pb["pb_high"]
 
-        state = setup_state(df_full, sig_high=sig_high, sig_low=sig_low, pb_low=pb_low, pb_high=pb_high)
-
         turnover = compute_turnover_egp(df_full)
         liq = liquidity_label(turnover)
         liq_score = liquidity_score(turnover)
@@ -464,6 +467,22 @@ if run_btn:
         t1 = levels.get("t1", float("nan"))
         t2 = levels.get("t2", float("nan"))
         t3 = levels.get("t3", float("nan"))
+
+        state = setup_state(
+            df_full,
+            sig_high=sig_high,
+            sig_low=sig_low,
+            pb_low=pb_low,
+            pb_high=pb_high,
+            entry=entry,
+        )
+
+        remaining_upside_pct = float("nan")
+        if np.isfinite(t2) and last_price > 0:
+            remaining_upside_pct = (t2 - last_price) / last_price
+
+        if np.isfinite(remaining_upside_pct) and remaining_upside_pct < MIN_REMAINING_UPSIDE_PCT:
+            state = "CHASED"
 
         rows.append({
             "signal_type": sig_type,
@@ -487,6 +506,7 @@ if run_btn:
             "spike_ratio": ratio,
             "turnover_egp": turnover,
             "last_price": last_price,
+            "remaining_upside_pct": remaining_upside_pct,
 
             "sig_high": sig_high,
             "sig_low": sig_low,
@@ -554,6 +574,7 @@ top["t1_%"] = np.where(np.isfinite(top["entry"]), (top["t1"] / top["entry"] - 1.
 top["t2_%"] = np.where(np.isfinite(top["entry"]), (top["t2"] / top["entry"] - 1.0) * 100.0, np.nan)
 top["t3_%"] = np.where(np.isfinite(top["entry"]), (top["t3"] / top["entry"] - 1.0) * 100.0, np.nan)
 top["move_%"] = np.where(np.isfinite(top["move_pct"]), top["move_pct"] * 100.0, np.nan)
+top["remaining_upside_%"] = np.where(np.isfinite(top["remaining_upside_pct"]), top["remaining_upside_pct"] * 100.0, np.nan)
 
 st.subheader(f"Top {TOP_N} (signal + setup state + liquidity)")
 
@@ -566,7 +587,8 @@ st.dataframe(
             "spike_ratio", "move_%", "turnover_egp", "last_price",
             "pb_low", "pb_high",
             "entry", "stop", "t1", "t2", "t3",
-            "stop_%", "t1_%", "t2_%", "t3_%"
+            "stop_%", "t1_%", "t2_%", "t3_%",
+            "remaining_upside_%"
         ]
     ],
     use_container_width=True,
@@ -629,6 +651,7 @@ if ai_btn:
             "liquidity": r.get("liquidity", "—"),
             "liquidity_score": int(r.get("liquidity_score", 99)),
             "last_price": float(r["last_price"]),
+            "remaining_upside_pct": None if pd.isna(r.get("remaining_upside_pct", np.nan)) else float(r["remaining_upside_pct"]),
 
             "pb_low": None if pd.isna(r.get("pb_low", np.nan)) else float(r["pb_low"]),
             "pb_high": None if pd.isna(r.get("pb_high", np.nan)) else float(r["pb_high"]),
@@ -658,6 +681,7 @@ Each candidate includes:
 - setup_state (second-leg readiness)
 - pullback zone pb_low..pb_high and levels (entry/stop/targets)
 - live + last_bar_time (data freshness)
+- remaining_upside_pct (remaining room to T2)
 
 Strategy:
 - Second-leg entries: wait for pullback into pb_low..pb_high and then continuation.
@@ -669,6 +693,7 @@ Scoring guidance (IMPORTANT):
 - Prefer signal_type = VOLUME_SPIKE over PRICE_EXPANSION when both are good.
 - Prefer higher turnover_egp.
 - Penalize chasing: if last_price > entry by more than 0.30%, recommend WAIT or SKIP.
+- Penalize setups with remaining_upside_pct < {MIN_REMAINING_UPSIDE_PCT:.3f}.
 - If spike_ratio is missing, explicitly state SPIKE UNKNOWN.
 
 Return ONLY:
@@ -683,7 +708,7 @@ Use ONLY the short codes above.
 
 For each pick:
 - ACTION: BUY NOW / WAIT / SKIP
-- WHY: 3-5 bullets referencing signal_type + (spike_ratio or move_pct) + turnover_egp/liquidity
+- WHY: 3-5 bullets referencing signal_type + (spike_ratio or move_pct) + turnover_egp/liquidity + remaining_upside_pct
 - LEVELS: Entry, Stop, T1, T2, T3 with % to each
 - NOTE: one caution line
 Then list remaining tickers with one-line reason each.
@@ -711,7 +736,6 @@ No JSON, no code.
             p_clean = p.replace(".CA", "").replace("$", "").strip().upper()
             hit = top[top["name"].astype(str).str.upper() == p_clean]
 
-            # fallback: match Yahoo symbol if AI used it
             if hit.empty:
                 hit = top[top["symbol"].astype(str).str.upper().str.replace("$", "", regex=False) == p_clean]
 
