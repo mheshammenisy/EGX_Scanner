@@ -1,4 +1,3 @@
-# app.py
 import os
 import re
 import json
@@ -76,28 +75,28 @@ LAST_MINUTES = 90
 STRONG_HIT = 2.5
 WATCHLIST_LOW = 2.0
 
-RECENT_BARS = 4
-IMPULSE_SPIKE_MIN = 2.0
+RECENT_BARS = 6
+IMPULSE_SPIKE_MIN = 1.8
 
-PULLBACK_MIN = 0.30
-PULLBACK_MAX = 0.60
-RETRACE_REJECT = 0.70
+PULLBACK_MIN = 0.20
+PULLBACK_MAX = 0.45
+RETRACE_REJECT = 0.65
 
-PRICE_WINDOW = 4
-MIN_MOVE_PCT = 0.02
-VOL_CONFIRM_MULT = 1.3
+PRICE_WINDOW = 6
+MIN_MOVE_PCT = 0.015
+VOL_CONFIRM_MULT = 1.2
 
 # New breakout-continuation detector
-BREAKOUT_LOOKBACK = 12
+BREAKOUT_LOOKBACK = 10
 BREAKOUT_BUFFER_PCT = 0.001
 BREAKOUT_MIN_BARS = 3
-BREAKOUT_VOL_MULT = 1.8
+BREAKOUT_VOL_MULT = 1.6
 
-MIN_TURNOVER_EGP = 2_000_000
+MIN_TURNOVER_EGP = 3_000_000
 USE_LIQUIDITY_FILTER = False
 
-ENTRY_CHASE_BUFFER_PCT = 0.003
-MIN_REMAINING_UPSIDE_PCT = 0.012
+ENTRY_CHASE_BUFFER_PCT = 0.0025
+MIN_REMAINING_UPSIDE_PCT = 0.03
 
 st.title("EGX Intraday Scanner (Always Shows Top 10)")
 
@@ -106,9 +105,9 @@ st.caption(
     f"vol_SMA={VOL_LOOKBACK} bars. "
     f"Buckets: ✅≥{STRONG_HIT}× | ⚠️ {WATCHLIST_LOW}–{STRONG_HIT}× | 👀 <{WATCHLIST_LOW}×. "
     f"Signals: 🚀 spike (≥{IMPULSE_SPIKE_MIN}× in last {RECENT_BARS}) OR "
-    f"📈 breakout (≥{MIN_MOVE_PCT*100:.0f}% + vol≥{VOL_CONFIRM_MULT}×) OR "
+    f"📈 breakout (≥{MIN_MOVE_PCT*100:.1f}% + vol≥{VOL_CONFIRM_MULT}×) OR "
     f"⚡ momentum breakout (local base + breakout + vol≥{BREAKOUT_VOL_MULT}×). "
-    f"Second-leg: pullback 30–60%. "
+    f"Second-leg: pullback 20–45%. "
     f"Late filter: chased if >{ENTRY_CHASE_BUFFER_PCT*100:.2f}% above entry or "
     f"<{MIN_REMAINING_UPSIDE_PCT*100:.1f}% upside left to T2."
 )
@@ -429,22 +428,22 @@ def build_levels_from_pullback(*, pb_low: float, pb_high: float) -> dict:
     Second-leg friendly levels:
     - entry: top of pullback zone with tiny buffer
     - stop: bottom of pullback zone
-    - targets: 1R / 2R / 3R
+    - targets: bigger follow-through targets, not tiny commission setups
     """
     if np.isnan(pb_low) or np.isnan(pb_high) or pb_low >= pb_high:
         return {}
 
-    entry = pb_high * 1.0001
-    stop = pb_low * 0.998
+    entry = pb_high * 1.0005
+    stop = pb_low * 0.997
     if stop >= entry:
         return {}
 
     R = entry - stop
-    R_cap = min(R, entry * 0.015)
+    R_unit = max(R, entry * 0.015)
 
-    t1 = entry + 1.0 * R_cap
-    t2 = entry + 2.0 * R_cap
-    t3 = entry + 3.0 * R_cap
+    t1 = entry + 1.5 * R_unit
+    t2 = entry + 3.0 * R_unit
+    t3 = entry + 4.5 * R_unit
 
     return {
         "entry": float(entry),
@@ -578,20 +577,20 @@ if run_btn:
             pb_low = float("nan")
             pb_high = float("nan")
 
-            entry = sig_high * 1.0005
-            stop = sig_low * 0.998
+            entry = sig_high * 1.0008
+            stop = sig_low * 0.997
             if stop >= entry:
                 continue
 
             R = entry - stop
-            R_cap = min(R, entry * 0.015)
-            t1 = entry + 1.0 * R_cap
-            t2 = entry + 2.0 * R_cap
-            t3 = entry + 3.0 * R_cap
+            R_unit = max(R, entry * 0.015)
+            t1 = entry + 1.5 * R_unit
+            t2 = entry + 3.0 * R_unit
+            t3 = entry + 4.5 * R_unit
 
-            if last_price > entry * 1.003:
+            if last_price > entry * 1.0025:
                 state = "CHASED"
-            elif last_price >= sig_high * 0.995:
+            elif last_price >= sig_high * 0.997:
                 state = "BREAKOUT_READY"
             else:
                 state = "WAIT_BREAKOUT"
@@ -667,8 +666,8 @@ if run_btn:
 
     if not ranked.empty:
         ranked = ranked.sort_values(
-            ["signal_rank", "state_rank", "liquidity_score", "bucket_rank", "spike_ratio", "turnover_egp"],
-            ascending=[True, True, True, True, False, False],
+            ["signal_rank", "state_rank", "liquidity_score", "remaining_upside_pct", "bucket_rank", "spike_ratio", "turnover_egp"],
+            ascending=[True, True, True, False, True, False, False],
         ).reset_index(drop=True)
 
     st.session_state["ranked"] = ranked
@@ -769,7 +768,7 @@ warm = ranked[ranked["bucket_rank"] == 2].copy()
 c1, c2, c3 = st.columns(3)
 c1.metric(f"✅ Strong (≥{STRONG_HIT}×)", len(strong))
 c2.metric(f"⚠️ Watchlist ({WATCHLIST_LOW}–{STRONG_HIT}×)", len(watch))
-c3.metric(f"👀 Warm (<{WATCHLIST_LOW})", len(warm))
+c3.metric(f"👀 Warm (<{WATCHLIST_LOW}×)", len(warm))
 
 with st.expander(f"✅ Strong (≥{STRONG_HIT}×)"):
     if not strong.empty:

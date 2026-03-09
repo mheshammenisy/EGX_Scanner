@@ -21,17 +21,17 @@ from egx_watchlist import EGX_SAFE_INTRADAY, display_name
 # -----------------------------
 # Strategy constants
 # -----------------------------
-PULLBACK_MIN = 0.30          # 30% retrace
-PULLBACK_MAX = 0.60          # 60% retrace
-RETRACE_REJECT = 0.70        # reject if >70% retrace
-ENTRY_CHASE_BUFFER_PCT = 0.003   # 0.30% above planned entry => chased
-MIN_REMAINING_UPSIDE_PCT = 0.012 # 1.2% to T2 required
+PULLBACK_MIN = 0.20
+PULLBACK_MAX = 0.45
+RETRACE_REJECT = 0.65
+ENTRY_CHASE_BUFFER_PCT = 0.0025
+MIN_REMAINING_UPSIDE_PCT = 0.03
 
 # Momentum breakout detection
-BREAKOUT_LOOKBACK = 12
+BREAKOUT_LOOKBACK = 10
 BREAKOUT_BUFFER_PCT = 0.001
 BREAKOUT_MIN_BARS = 3
-BREAKOUT_VOL_MULT = 1.8
+BREAKOUT_VOL_MULT = 1.6
 
 
 # -----------------------------
@@ -124,29 +124,29 @@ def compute_pullback_zone(sig_high: float, sig_low: float) -> dict:
 def build_levels_from_pullback(*, pb_low: float, pb_high: float) -> dict:
     """
     Second-leg friendly levels:
-    - entry: top of pullback zone with tiny buffer
+    - entry: top of pullback zone with small buffer
     - stop: bottom of pullback zone
-    - targets: 1R / 2R / 3R (capped)
+    - targets: bigger follow-through targets, not tiny commission setups
     """
     if np.isnan(pb_low) or np.isnan(pb_high) or pb_low >= pb_high:
         return {}
 
-    entry = pb_high * 1.0001
-    stop = pb_low * 0.998
+    entry = pb_high * 1.0005
+    stop = pb_low * 0.997
     if stop >= entry:
         return {}
 
-    R = entry - stop
-    R_cap = min(R, entry * 0.015)  # cap R to 1.5% of entry to avoid crazy wide levels
+    risk_R = entry - stop
+    R_unit = max(risk_R, entry * 0.015)
 
-    t1 = entry + 1.0 * R_cap
-    t2 = entry + 2.0 * R_cap
-    t3 = entry + 3.0 * R_cap
+    t1 = entry + 1.5 * R_unit
+    t2 = entry + 3.0 * R_unit
+    t3 = entry + 4.5 * R_unit
 
     return {
         "entry": float(entry),
         "stop": float(stop),
-        "risk_R": float(R),
+        "risk_R": float(risk_R),
         "t1": float(t1),
         "t2": float(t2),
         "t3": float(t3),
@@ -194,11 +194,11 @@ def find_recent_signal(
     df: pd.DataFrame,
     *,
     vol_lookback: int = 20,
-    recent_bars: int = 4,
-    spike_min: float = 2.5,
-    price_window: int = 4,
-    min_move_pct: float = 0.02,
-    vol_confirm_mult: float = 1.3,
+    recent_bars: int = 6,
+    spike_min: float = 1.8,
+    price_window: int = 6,
+    min_move_pct: float = 0.015,
+    vol_confirm_mult: float = 1.2,
 ) -> Optional[dict]:
     """
     Delay-proof detection within last `recent_bars` completed bars.
@@ -221,7 +221,7 @@ def find_recent_signal(
 
     end = last_completed_bar_index(work)
     start = end - recent_bars + 1
-    window = work.iloc[start : end + 1].copy()
+    window = work.iloc[start:end + 1].copy()
     window = window.dropna(subset=["spike_ratio", "vol_sma"])
 
     if window.empty:
@@ -237,6 +237,7 @@ def find_recent_signal(
             "spike_ratio": float(bar["spike_ratio"]),
             "high": float(bar["High"]),
             "low": float(bar["Low"]),
+            "move_pct": float("nan"),
         }
 
     pw = min(price_window, len(window))
@@ -267,6 +268,7 @@ def find_recent_signal(
         "spike_ratio": float(bar["spike_ratio"]),
         "high": float(block_high),
         "low": float(block_low),
+        "move_pct": float(move_pct),
     }
 
 
@@ -280,9 +282,12 @@ def find_momentum_breakout(df: pd.DataFrame) -> Optional[dict]:
         return None
 
     work = df.copy()
-    work["vol_sma"] = work["Volume"].rolling(20).mean()
+    work["vol_sma"] = work["Volume"].rolling(20, min_periods=20).mean()
 
     end = last_completed_bar_index(work)
+    if len(work) < abs(end) + 1:
+        return None
+
     bar = work.iloc[end]
 
     if pd.isna(bar["vol_sma"]):
@@ -306,12 +311,17 @@ def find_momentum_breakout(df: pd.DataFrame) -> Optional[dict]:
     if not (broke_out and vol_ok and green_bar):
         return None
 
+    move_pct = float("nan")
+    if base_low > 0:
+        move_pct = (bar_high - base_low) / base_low
+
     return {
         "type": "MOMENTUM_BREAKOUT",
         "time": work.index[end],
         "spike_ratio": float(bar["Volume"] / bar["vol_sma"]),
         "high": bar_high,
         "low": base_low,
+        "move_pct": float(move_pct),
     }
 
 
@@ -351,11 +361,11 @@ def compute_trade_plan_from_signal(
     df: pd.DataFrame,
     *,
     vol_lookback: int = 20,
-    recent_bars: int = 4,
-    spike_min: float = 2.5,
-    price_window: int = 4,
-    min_move_pct: float = 0.02,
-    vol_confirm_mult: float = 1.3,
+    recent_bars: int = 6,
+    spike_min: float = 1.8,
+    price_window: int = 6,
+    min_move_pct: float = 0.015,
+    vol_confirm_mult: float = 1.2,
     require_green_bar: bool = True,
     atr_n: int = 14,
 ) -> Optional[TradePlan]:
@@ -404,21 +414,21 @@ def compute_trade_plan_from_signal(
         pb_low = float("nan")
         pb_high = float("nan")
 
-        entry = sig_high * 1.0005
-        stop = sig_low * 0.998
+        entry = sig_high * 1.0008
+        stop = sig_low * 0.997
         if stop >= entry:
             return None
 
         risk_R = entry - stop
-        R_cap = min(risk_R, entry * 0.015)
+        R_unit = max(risk_R, entry * 0.015)
 
-        t1 = entry + 1.0 * R_cap
-        t2 = entry + 2.0 * R_cap
-        t3 = entry + 3.0 * R_cap
+        t1 = entry + 1.5 * R_unit
+        t2 = entry + 3.0 * R_unit
+        t3 = entry + 4.5 * R_unit
 
-        if last_price > entry * 1.003:
+        if last_price > entry * 1.0025:
             state = "CHASED"
-        elif last_price >= sig_high * 0.995:
+        elif last_price >= sig_high * 0.997:
             state = "BREAKOUT_READY"
         else:
             state = "WAIT_BREAKOUT"
@@ -506,11 +516,11 @@ def scan_once(
     interval: str = "5m",
     period: str = "5d",
     vol_lookback: int = 20,
-    spike_min: float = 2.5,
-    recent_bars: int = 4,
-    price_window: int = 4,
-    min_move_pct: float = 0.02,
-    vol_confirm_mult: float = 1.3,
+    spike_min: float = 1.8,
+    recent_bars: int = 6,
+    price_window: int = 6,
+    min_move_pct: float = 0.015,
+    vol_confirm_mult: float = 1.2,
     min_turnover_egp: float = 0.0,
     last_minutes: int = 15,
     require_green_bar: bool = True,
@@ -573,8 +583,8 @@ def scan_once(
     out["signal_rank"] = out["signal_type"].map(signal_order).fillna(9)
 
     out = out.sort_values(
-        ["signal_rank", "state_rank", "turnover_egp", "spike_mult"],
-        ascending=[True, True, False, False],
+        ["signal_rank", "state_rank", "remaining_upside_pct", "turnover_egp", "spike_mult"],
+        ascending=[True, True, False, False, False],
     ).reset_index(drop=True)
 
     return out
@@ -585,11 +595,11 @@ def scan_once(
 # -----------------------------
 def main():
     parser = argparse.ArgumentParser()
-    parser.add_argument("--spike_min", type=float, default=2.5)
-    parser.add_argument("--recent_bars", type=int, default=4)
-    parser.add_argument("--price_window", type=int, default=4)
-    parser.add_argument("--min_move_pct", type=float, default=0.02)
-    parser.add_argument("--vol_confirm_mult", type=float, default=1.3)
+    parser.add_argument("--spike_min", type=float, default=1.8)
+    parser.add_argument("--recent_bars", type=int, default=6)
+    parser.add_argument("--price_window", type=int, default=6)
+    parser.add_argument("--min_move_pct", type=float, default=0.015)
+    parser.add_argument("--vol_confirm_mult", type=float, default=1.2)
     parser.add_argument("--last_minutes", type=int, default=15)
     args = parser.parse_args()
 
