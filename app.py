@@ -96,7 +96,12 @@ MIN_TURNOVER_EGP = 3_000_000
 USE_LIQUIDITY_FILTER = False
 
 ENTRY_CHASE_BUFFER_PCT = 0.0025
-MIN_REMAINING_UPSIDE_PCT = 0.03
+MIN_REMAINING_UPSIDE_PCT = 0.012
+
+# Reject weak EGX setups completely
+MIN_T1_PCT = 1.0
+MIN_T2_PCT = 2.5
+MIN_T3_PCT = 4.0
 
 st.title("EGX Intraday Scanner (Always Shows Top 10)")
 
@@ -109,7 +114,8 @@ st.caption(
     f"⚡ momentum breakout (local base + breakout + vol≥{BREAKOUT_VOL_MULT}×). "
     f"Second-leg: pullback 20–45%. "
     f"Late filter: chased if >{ENTRY_CHASE_BUFFER_PCT*100:.2f}% above entry or "
-    f"<{MIN_REMAINING_UPSIDE_PCT*100:.1f}% upside left to T2."
+    f"<{MIN_REMAINING_UPSIDE_PCT*100:.1f}% upside left to T2. "
+    f"Quality filter: T1≥{MIN_T1_PCT:.1f}% | T2≥{MIN_T2_PCT:.1f}% | T3≥{MIN_T3_PCT:.1f}%."
 )
 
 
@@ -222,16 +228,6 @@ def compute_turnover_egp(df: pd.DataFrame, bars: int = 78) -> float:
 
 
 def compute_recent_signal(df: pd.DataFrame) -> dict:
-    """
-    Delay-proof signal detection inside last RECENT_BARS completed bars.
-
-    Type A: VOLUME_SPIKE
-      spike_ratio >= IMPULSE_SPIKE_MIN
-
-    Type B: PRICE_EXPANSION
-      (max_high - min_low)/min_low >= MIN_MOVE_PCT within last PRICE_WINDOW bars
-      AND at least one bar has Volume >= VOL_CONFIRM_MULT * vol_sma
-    """
     df = ensure_ohlcv(df)
     if df.empty or len(df) < VOL_LOOKBACK + RECENT_BARS + 2:
         return {
@@ -314,14 +310,6 @@ def compute_recent_signal(df: pd.DataFrame) -> dict:
 
 
 def compute_breakout_continuation(df: pd.DataFrame) -> dict:
-    """
-    Detect momentum continuation without needing a deep pullback.
-
-    Idea:
-    - recent bars build a local base
-    - latest completed bar breaks above recent highs
-    - breakout bar volume confirms
-    """
     df = ensure_ohlcv(df)
     if df.empty or len(df) < max(VOL_LOOKBACK + 2, BREAKOUT_LOOKBACK + 3):
         return {
@@ -423,27 +411,67 @@ def compute_pullback_zone(sig_high: float, sig_low: float) -> dict:
     return {"pb_low": float(pb_low), "pb_high": float(pb_high), "sig_range": float(rng)}
 
 
-def build_levels_from_pullback(*, pb_low: float, pb_high: float) -> dict:
-    """
-    Second-leg friendly levels:
-    - entry: top of pullback zone with tiny buffer
-    - stop: bottom of pullback zone
-    - targets: bigger follow-through targets, not tiny commission setups
-    """
-    if np.isnan(pb_low) or np.isnan(pb_high) or pb_low >= pb_high:
+def build_levels_from_pullback(*, sig_high: float, sig_low: float, pb_low: float, pb_high: float) -> dict:
+    if (
+        np.isnan(sig_high)
+        or np.isnan(sig_low)
+        or np.isnan(pb_low)
+        or np.isnan(pb_high)
+        or pb_low >= pb_high
+        or sig_high <= sig_low
+    ):
         return {}
 
+    rng = sig_high - sig_low
     entry = pb_high * 1.0005
-    stop = pb_low * 0.997
+
+    structural_stop = min(pb_low * 0.9985, sig_low * 0.9990)
+    stop = structural_stop
+
+    if stop >= entry:
+        stop = pb_low * 0.9990
+
     if stop >= entry:
         return {}
 
-    R = entry - stop
-    R_unit = max(R, entry * 0.015)
+    t1 = max(sig_high, entry * 1.0030)
+    t2 = max(sig_high + 0.50 * rng, entry * 1.0100)
+    t3 = max(sig_high + 1.00 * rng, entry * 1.0180)
 
-    t1 = entry + 1.5 * R_unit
-    t2 = entry + 3.0 * R_unit
-    t3 = entry + 4.5 * R_unit
+    if not (entry < t1 < t2 < t3):
+        return {}
+
+    return {
+        "entry": float(entry),
+        "stop": float(stop),
+        "t1": float(t1),
+        "t2": float(t2),
+        "t3": float(t3),
+    }
+
+
+def build_levels_from_breakout(*, sig_high: float, sig_low: float) -> dict:
+    if np.isnan(sig_high) or np.isnan(sig_low) or sig_high <= sig_low:
+        return {}
+
+    rng = sig_high - sig_low
+    entry = sig_high * 1.0008
+
+    stop = max(sig_high - 0.45 * rng, sig_low * 1.0000)
+    stop = min(stop, entry * 0.9950)
+
+    if stop >= entry:
+        stop = sig_high - 0.35 * rng
+
+    if stop >= entry:
+        return {}
+
+    t1 = max(sig_high + 0.50 * rng, entry * 1.0100)
+    t2 = max(sig_high + 1.00 * rng, entry * 1.0250)
+    t3 = max(sig_high + 1.50 * rng, entry * 1.0400)
+
+    if not (entry < t1 < t2 < t3):
+        return {}
 
     return {
         "entry": float(entry),
@@ -486,6 +514,23 @@ def setup_state(
         return "WAIT_PULLBACK"
 
     return "PULLING_BACK"
+
+
+def passes_target_quality(entry: float, t1: float, t2: float, t3: float) -> bool:
+    if not np.isfinite(entry) or entry <= 0:
+        return False
+    if not np.isfinite(t1) or not np.isfinite(t2) or not np.isfinite(t3):
+        return False
+
+    t1_pct = ((t1 / entry) - 1.0) * 100.0
+    t2_pct = ((t2 / entry) - 1.0) * 100.0
+    t3_pct = ((t3 / entry) - 1.0) * 100.0
+
+    return (
+        t1_pct >= MIN_T1_PCT
+        and t2_pct >= MIN_T2_PCT
+        and t3_pct >= MIN_T3_PCT
+    )
 
 
 # -----------------------------
@@ -577,34 +622,48 @@ if run_btn:
             pb_low = float("nan")
             pb_high = float("nan")
 
-            entry = sig_high * 1.0008
-            stop = sig_low * 0.997
-            if stop >= entry:
+            levels = build_levels_from_breakout(sig_high=sig_high, sig_low=sig_low)
+            if not levels:
                 continue
 
-            R = entry - stop
-            R_unit = max(R, entry * 0.015)
-            t1 = entry + 1.5 * R_unit
-            t2 = entry + 3.0 * R_unit
-            t3 = entry + 4.5 * R_unit
+            entry = levels["entry"]
+            stop = levels["stop"]
+            t1 = levels["t1"]
+            t2 = levels["t2"]
+            t3 = levels["t3"]
 
-            if last_price > entry * 1.0025:
+            if not passes_target_quality(entry, t1, t2, t3):
+                continue
+
+            if last_price > entry * (1.0 + ENTRY_CHASE_BUFFER_PCT):
                 state = "CHASED"
             elif last_price >= sig_high * 0.997:
                 state = "BREAKOUT_READY"
             else:
                 state = "WAIT_BREAKOUT"
+
         else:
             pb = compute_pullback_zone(sig_high, sig_low)
             pb_low = pb["pb_low"]
             pb_high = pb["pb_high"]
 
-            levels = build_levels_from_pullback(pb_low=pb_low, pb_high=pb_high)
-            entry = levels.get("entry", float("nan"))
-            stop = levels.get("stop", float("nan"))
-            t1 = levels.get("t1", float("nan"))
-            t2 = levels.get("t2", float("nan"))
-            t3 = levels.get("t3", float("nan"))
+            levels = build_levels_from_pullback(
+                sig_high=sig_high,
+                sig_low=sig_low,
+                pb_low=pb_low,
+                pb_high=pb_high,
+            )
+            if not levels:
+                continue
+
+            entry = levels["entry"]
+            stop = levels["stop"]
+            t1 = levels["t1"]
+            t2 = levels["t2"]
+            t3 = levels["t3"]
+
+            if not passes_target_quality(entry, t1, t2, t3):
+                continue
 
             state = setup_state(
                 df_full,
@@ -701,7 +760,7 @@ if ranked.empty and meta["data_ok"] == 0:
     st.stop()
 
 if ranked.empty:
-    st.warning("No rows built (unexpected).")
+    st.warning("No rows built after filtering weak setups.")
     st.stop()
 
 
@@ -736,6 +795,8 @@ display_cols = [
     "move_%",
     "turnover_egp",
     "last_price",
+    "sig_low",
+    "sig_high",
     "pb_low",
     "pb_high",
     "entry",
@@ -836,7 +897,7 @@ if ai_btn:
             "t3_pct": None if pd.isna(r["t3_%"]) else float(r["t3_%"]),
         })
 
-    allowed = ", ".join(top["name"].astype(str).str.upper().tolist())
+    allowed = ", ".join(top["symbol"].astype(str).str.upper().tolist())
 
     instruction = f"""
 You are an EGX intraday trading assistant.
@@ -851,22 +912,20 @@ Each candidate includes:
 - live + last_bar_time (data freshness)
 - remaining_upside_pct (remaining room to T2)
 
-Strategy:
-- Pullback setups: wait for pullback into pb_low..pb_high and then continuation.
-- Breakout setups: breakout readiness matters more than pullback zone.
-
-Scoring guidance (IMPORTANT):
+Scoring guidance:
 - Prefer liquidity: ✅ Very High > ✅ High > ⚠️ Medium. Strongly penalize ❌ Low.
 - Prefer setup_state in this order: IN_PULLBACK_ZONE > BREAKOUT_READY > PULLING_BACK > WAIT_BREAKOUT > WAIT_PULLBACK. Avoid CHASED/REJECT_DEEP.
-- Prefer signal_type = VOLUME_SPIKE, then MOMENTUM_BREAKOUT, then PRICE_EXPANSION when both are otherwise similar.
+- Prefer signal_type = VOLUME_SPIKE, then MOMENTUM_BREAKOUT, then PRICE_EXPANSION when otherwise similar.
 - Prefer higher turnover_egp.
 - Penalize chasing: if last_price > entry by more than 0.30%, recommend WAIT or SKIP.
 - Penalize setups with remaining_upside_pct < {MIN_REMAINING_UPSIDE_PCT:.3f}.
+- Reject weak targets below EGX quality threshold.
 - If spike_ratio is missing, explicitly state SPIKE UNKNOWN.
 
 Return ONLY:
 PICK: exactly 2 items, ONLY from this allowed list:
 {allowed}
+
 Format MUST be exactly:
 PICK: CODE1, CODE2
 
@@ -902,10 +961,8 @@ No JSON, no code.
         shown = 0
         for p in picks:
             p_clean = p.replace(".CA", "").replace("$", "").strip().upper()
-            hit = top[top["name"].astype(str).str.upper() == p_clean]
 
-            if hit.empty:
-                hit = top[top["symbol"].astype(str).str.upper().str.replace("$", "", regex=False) == p_clean]
+            hit = top[top["symbol"].astype(str).str.upper().str.replace("$", "", regex=False) == p_clean]
 
             if hit.empty:
                 continue
@@ -914,4 +971,4 @@ No JSON, no code.
             shown += 1
 
         if shown == 0:
-            st.info("AI picks did not match the Top 10 names; no charts rendered.")
+            st.info("AI picks did not match the Top 10 symbols; no charts rendered.")

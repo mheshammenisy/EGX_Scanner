@@ -25,7 +25,12 @@ PULLBACK_MIN = 0.20
 PULLBACK_MAX = 0.45
 RETRACE_REJECT = 0.65
 ENTRY_CHASE_BUFFER_PCT = 0.0025
-MIN_REMAINING_UPSIDE_PCT = 0.03
+MIN_REMAINING_UPSIDE_PCT = 0.012
+
+# Reject weak EGX setups
+MIN_T1_PCT = 1.0
+MIN_T2_PCT = 2.5
+MIN_T3_PCT = 4.0
 
 # Momentum breakout detection
 BREAKOUT_LOOKBACK = 10
@@ -121,36 +126,108 @@ def compute_pullback_zone(sig_high: float, sig_low: float) -> dict:
     return {"pb_low": float(pb_low), "pb_high": float(pb_high), "sig_range": float(rng)}
 
 
-def build_levels_from_pullback(*, pb_low: float, pb_high: float) -> dict:
+def build_levels_from_pullback(*, sig_high: float, sig_low: float, pb_low: float, pb_high: float) -> dict:
     """
-    Second-leg friendly levels:
-    - entry: top of pullback zone with small buffer
-    - stop: bottom of pullback zone
-    - targets: bigger follow-through targets, not tiny commission setups
+    Structure-based pullback levels:
+    - entry: reclaim upper pullback zone
+    - stop: under lower pullback zone / signal low buffer
+    - T1: retest signal high
+    - T2: signal high + 50% of impulse range
+    - T3: signal high + 100% of impulse range
     """
-    if np.isnan(pb_low) or np.isnan(pb_high) or pb_low >= pb_high:
+    if (
+        np.isnan(sig_high)
+        or np.isnan(sig_low)
+        or np.isnan(pb_low)
+        or np.isnan(pb_high)
+        or pb_low >= pb_high
+        or sig_high <= sig_low
+    ):
         return {}
 
+    rng = sig_high - sig_low
     entry = pb_high * 1.0005
-    stop = pb_low * 0.997
+
+    structural_stop = min(pb_low * 0.9985, sig_low * 0.9990)
+    stop = structural_stop
+
+    if stop >= entry:
+        stop = pb_low * 0.9990
+
     if stop >= entry:
         return {}
 
-    risk_R = entry - stop
-    R_unit = max(risk_R, entry * 0.015)
+    t1 = max(sig_high, entry * 1.0030)
+    t2 = max(sig_high + 0.50 * rng, entry * 1.0100)
+    t3 = max(sig_high + 1.00 * rng, entry * 1.0180)
 
-    t1 = entry + 1.5 * R_unit
-    t2 = entry + 3.0 * R_unit
-    t3 = entry + 4.5 * R_unit
+    if not (entry < t1 < t2 < t3):
+        return {}
 
     return {
         "entry": float(entry),
         "stop": float(stop),
-        "risk_R": float(risk_R),
+        "risk_R": float(entry - stop),
         "t1": float(t1),
         "t2": float(t2),
         "t3": float(t3),
     }
+
+
+def build_levels_from_breakout(*, sig_high: float, sig_low: float) -> dict:
+    """
+    Structure-based breakout levels:
+    - entry: just above breakout high
+    - stop: inside/under base, not huge
+    - T1/T2/T3: measured move from base range
+    """
+    if np.isnan(sig_high) or np.isnan(sig_low) or sig_high <= sig_low:
+        return {}
+
+    rng = sig_high - sig_low
+    entry = sig_high * 1.0008
+
+    stop = max(sig_high - 0.45 * rng, sig_low * 1.0000)
+    stop = min(stop, entry * 0.9950)
+
+    if stop >= entry:
+        stop = sig_high - 0.35 * rng
+
+    if stop >= entry:
+        return {}
+
+    t1 = max(sig_high + 0.50 * rng, entry * 1.0100)
+    t2 = max(sig_high + 1.00 * rng, entry * 1.0250)
+    t3 = max(sig_high + 1.50 * rng, entry * 1.0400)
+
+    if not (entry < t1 < t2 < t3):
+        return {}
+
+    return {
+        "entry": float(entry),
+        "stop": float(stop),
+        "risk_R": float(entry - stop),
+        "t1": float(t1),
+        "t2": float(t2),
+        "t3": float(t3),
+    }
+
+
+def passes_target_quality(entry: float, t1: float, t2: float, t3: float) -> bool:
+    if not np.isfinite(entry) or entry <= 0:
+        return False
+    if not np.isfinite(t1) or not np.isfinite(t2) or not np.isfinite(t3):
+        return False
+
+    t1_pct = ((t1 / entry) - 1.0) * 100.0
+    t2_pct = ((t2 / entry) - 1.0) * 100.0
+    t3_pct = ((t3 / entry) - 1.0) * 100.0
+
+    return (
+        t1_pct >= MIN_T1_PCT
+        and t2_pct >= MIN_T2_PCT
+        and t3_pct >= MIN_T3_PCT
+    )
 
 
 def setup_state(
@@ -414,19 +491,21 @@ def compute_trade_plan_from_signal(
         pb_low = float("nan")
         pb_high = float("nan")
 
-        entry = sig_high * 1.0008
-        stop = sig_low * 0.997
-        if stop >= entry:
+        levels = build_levels_from_breakout(sig_high=sig_high, sig_low=sig_low)
+        if not levels:
             return None
 
-        risk_R = entry - stop
-        R_unit = max(risk_R, entry * 0.015)
+        entry = float(levels["entry"])
+        stop = float(levels["stop"])
+        risk_R = float(levels["risk_R"])
+        t1 = float(levels["t1"])
+        t2 = float(levels["t2"])
+        t3 = float(levels["t3"])
 
-        t1 = entry + 1.5 * R_unit
-        t2 = entry + 3.0 * R_unit
-        t3 = entry + 4.5 * R_unit
+        if not passes_target_quality(entry, t1, t2, t3):
+            return None
 
-        if last_price > entry * 1.0025:
+        if last_price > entry * (1.0 + ENTRY_CHASE_BUFFER_PCT):
             state = "CHASED"
         elif last_price >= sig_high * 0.997:
             state = "BREAKOUT_READY"
@@ -437,16 +516,24 @@ def compute_trade_plan_from_signal(
         pb_low = float(pb["pb_low"])
         pb_high = float(pb["pb_high"])
 
-        levels = build_levels_from_pullback(pb_low=pb_low, pb_high=pb_high)
+        levels = build_levels_from_pullback(
+            sig_high=sig_high,
+            sig_low=sig_low,
+            pb_low=pb_low,
+            pb_high=pb_high,
+        )
         if not levels:
             return None
 
         entry = float(levels["entry"])
         stop = float(levels["stop"])
+        risk_R = float(levels["risk_R"])
         t1 = float(levels["t1"])
         t2 = float(levels["t2"])
         t3 = float(levels["t3"])
-        risk_R = float(levels["risk_R"])
+
+        if not passes_target_quality(entry, t1, t2, t3):
+            return None
 
         state = setup_state(
             work,
