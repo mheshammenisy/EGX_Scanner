@@ -99,9 +99,9 @@ ENTRY_CHASE_BUFFER_PCT = 0.0025
 MIN_REMAINING_UPSIDE_PCT = 0.012
 
 # Reject weak EGX setups completely
-MIN_T1_PCT = 1.0
-MIN_T2_PCT = 2.5
-MIN_T3_PCT = 4.0
+MIN_T1_PCT = 0.7
+MIN_T2_PCT = 1.8
+MIN_T3_PCT = 3.0
 
 st.title("EGX Intraday Scanner (Always Shows Top 10)")
 
