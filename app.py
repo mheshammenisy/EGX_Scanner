@@ -86,7 +86,7 @@ PRICE_WINDOW = 6
 MIN_MOVE_PCT = 0.015
 VOL_CONFIRM_MULT = 1.2
 
-# New breakout-continuation detector
+# Breakout-continuation detector
 BREAKOUT_LOOKBACK = 10
 BREAKOUT_BUFFER_PCT = 0.001
 BREAKOUT_MIN_BARS = 3
@@ -97,11 +97,6 @@ USE_LIQUIDITY_FILTER = False
 
 ENTRY_CHASE_BUFFER_PCT = 0.0025
 MIN_REMAINING_UPSIDE_PCT = 0.012
-
-# Reject weak EGX setups completely
-MIN_T1_PCT = 0.7
-MIN_T2_PCT = 1.8
-MIN_T3_PCT = 3.0
 
 st.title("EGX Intraday Scanner (Always Shows Top 10)")
 
@@ -114,8 +109,7 @@ st.caption(
     f"⚡ momentum breakout (local base + breakout + vol≥{BREAKOUT_VOL_MULT}×). "
     f"Second-leg: pullback 20–45%. "
     f"Late filter: chased if >{ENTRY_CHASE_BUFFER_PCT*100:.2f}% above entry or "
-    f"<{MIN_REMAINING_UPSIDE_PCT*100:.1f}% upside left to T2. "
-    f"Quality filter: T1≥{MIN_T1_PCT:.1f}% | T2≥{MIN_T2_PCT:.1f}% | T3≥{MIN_T3_PCT:.1f}%."
+    f"<{MIN_REMAINING_UPSIDE_PCT*100:.1f}% upside left to T2."
 )
 
 
@@ -466,9 +460,9 @@ def build_levels_from_breakout(*, sig_high: float, sig_low: float) -> dict:
     if stop >= entry:
         return {}
 
-    t1 = max(sig_high + 0.50 * rng, entry * 1.0100)
-    t2 = max(sig_high + 1.00 * rng, entry * 1.0250)
-    t3 = max(sig_high + 1.50 * rng, entry * 1.0400)
+    t1 = max(sig_high + 0.50 * rng, entry * 1.0040)
+    t2 = max(sig_high + 1.00 * rng, entry * 1.0100)
+    t3 = max(sig_high + 1.50 * rng, entry * 1.0160)
 
     if not (entry < t1 < t2 < t3):
         return {}
@@ -514,23 +508,6 @@ def setup_state(
         return "WAIT_PULLBACK"
 
     return "PULLING_BACK"
-
-
-def passes_target_quality(entry: float, t1: float, t2: float, t3: float) -> bool:
-    if not np.isfinite(entry) or entry <= 0:
-        return False
-    if not np.isfinite(t1) or not np.isfinite(t2) or not np.isfinite(t3):
-        return False
-
-    t1_pct = ((t1 / entry) - 1.0) * 100.0
-    t2_pct = ((t2 / entry) - 1.0) * 100.0
-    t3_pct = ((t3 / entry) - 1.0) * 100.0
-
-    return (
-        t1_pct >= MIN_T1_PCT
-        and t2_pct >= MIN_T2_PCT
-        and t3_pct >= MIN_T3_PCT
-    )
 
 
 # -----------------------------
@@ -632,9 +609,6 @@ if run_btn:
             t2 = levels["t2"]
             t3 = levels["t3"]
 
-            if not passes_target_quality(entry, t1, t2, t3):
-                continue
-
             if last_price > entry * (1.0 + ENTRY_CHASE_BUFFER_PCT):
                 state = "CHASED"
             elif last_price >= sig_high * 0.997:
@@ -661,9 +635,6 @@ if run_btn:
             t1 = levels["t1"]
             t2 = levels["t2"]
             t3 = levels["t3"]
-
-            if not passes_target_quality(entry, t1, t2, t3):
-                continue
 
             state = setup_state(
                 df_full,
@@ -760,7 +731,7 @@ if ranked.empty and meta["data_ok"] == 0:
     st.stop()
 
 if ranked.empty:
-    st.warning("No rows built after filtering weak setups.")
+    st.warning("No rows built (unexpected).")
     st.stop()
 
 
@@ -919,7 +890,6 @@ Scoring guidance:
 - Prefer higher turnover_egp.
 - Penalize chasing: if last_price > entry by more than 0.30%, recommend WAIT or SKIP.
 - Penalize setups with remaining_upside_pct < {MIN_REMAINING_UPSIDE_PCT:.3f}.
-- Reject weak targets below EGX quality threshold.
 - If spike_ratio is missing, explicitly state SPIKE UNKNOWN.
 
 Return ONLY:

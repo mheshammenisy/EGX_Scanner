@@ -27,11 +27,6 @@ RETRACE_REJECT = 0.65
 ENTRY_CHASE_BUFFER_PCT = 0.0025
 MIN_REMAINING_UPSIDE_PCT = 0.012
 
-# Reject weak EGX setups
-MIN_T1_PCT = 1.0
-MIN_T2_PCT = 2.5
-MIN_T3_PCT = 4.0
-
 # Momentum breakout detection
 BREAKOUT_LOOKBACK = 10
 BREAKOUT_BUFFER_PCT = 0.001
@@ -94,10 +89,6 @@ def cairo_now() -> pd.Timestamp:
 
 
 def filter_last_minutes(df: pd.DataFrame, *, minutes: int) -> pd.DataFrame:
-    """
-    Keep only rows inside the last N minutes (Cairo time).
-    Used by the Streamlit app / freshness gate for CLI.
-    """
     if df.empty:
         return df
 
@@ -127,14 +118,6 @@ def compute_pullback_zone(sig_high: float, sig_low: float) -> dict:
 
 
 def build_levels_from_pullback(*, sig_high: float, sig_low: float, pb_low: float, pb_high: float) -> dict:
-    """
-    Structure-based pullback levels:
-    - entry: reclaim upper pullback zone
-    - stop: under lower pullback zone / signal low buffer
-    - T1: retest signal high
-    - T2: signal high + 50% of impulse range
-    - T3: signal high + 100% of impulse range
-    """
     if (
         np.isnan(sig_high)
         or np.isnan(sig_low)
@@ -175,12 +158,6 @@ def build_levels_from_pullback(*, sig_high: float, sig_low: float, pb_low: float
 
 
 def build_levels_from_breakout(*, sig_high: float, sig_low: float) -> dict:
-    """
-    Structure-based breakout levels:
-    - entry: just above breakout high
-    - stop: inside/under base, not huge
-    - T1/T2/T3: measured move from base range
-    """
     if np.isnan(sig_high) or np.isnan(sig_low) or sig_high <= sig_low:
         return {}
 
@@ -196,9 +173,9 @@ def build_levels_from_breakout(*, sig_high: float, sig_low: float) -> dict:
     if stop >= entry:
         return {}
 
-    t1 = max(sig_high + 0.50 * rng, entry * 1.0100)
-    t2 = max(sig_high + 1.00 * rng, entry * 1.0250)
-    t3 = max(sig_high + 1.50 * rng, entry * 1.0400)
+    t1 = max(sig_high + 0.50 * rng, entry * 1.0040)
+    t2 = max(sig_high + 1.00 * rng, entry * 1.0100)
+    t3 = max(sig_high + 1.50 * rng, entry * 1.0160)
 
     if not (entry < t1 < t2 < t3):
         return {}
@@ -211,23 +188,6 @@ def build_levels_from_breakout(*, sig_high: float, sig_low: float) -> dict:
         "t2": float(t2),
         "t3": float(t3),
     }
-
-
-def passes_target_quality(entry: float, t1: float, t2: float, t3: float) -> bool:
-    if not np.isfinite(entry) or entry <= 0:
-        return False
-    if not np.isfinite(t1) or not np.isfinite(t2) or not np.isfinite(t3):
-        return False
-
-    t1_pct = ((t1 / entry) - 1.0) * 100.0
-    t2_pct = ((t2 / entry) - 1.0) * 100.0
-    t3_pct = ((t3 / entry) - 1.0) * 100.0
-
-    return (
-        t1_pct >= MIN_T1_PCT
-        and t2_pct >= MIN_T2_PCT
-        and t3_pct >= MIN_T3_PCT
-    )
 
 
 def setup_state(
@@ -277,13 +237,6 @@ def find_recent_signal(
     min_move_pct: float = 0.015,
     vol_confirm_mult: float = 1.2,
 ) -> Optional[dict]:
-    """
-    Delay-proof detection within last `recent_bars` completed bars.
-
-    Priority:
-    1) Volume Spike (>= spike_min * vol_sma)
-    2) Price Expansion (>= min_move_pct) + mild volume confirm (>= vol_confirm_mult * vol_sma)
-    """
     df = ensure_ohlcv(df)
     if df.empty:
         return None
@@ -350,9 +303,6 @@ def find_recent_signal(
 
 
 def find_momentum_breakout(df: pd.DataFrame) -> Optional[dict]:
-    """
-    Detect breakout continuation without pullback.
-    """
     df = ensure_ohlcv(df)
 
     if len(df) < BREAKOUT_LOOKBACK + 5:
@@ -502,9 +452,6 @@ def compute_trade_plan_from_signal(
         t2 = float(levels["t2"])
         t3 = float(levels["t3"])
 
-        if not passes_target_quality(entry, t1, t2, t3):
-            return None
-
         if last_price > entry * (1.0 + ENTRY_CHASE_BUFFER_PCT):
             state = "CHASED"
         elif last_price >= sig_high * 0.997:
@@ -531,9 +478,6 @@ def compute_trade_plan_from_signal(
         t1 = float(levels["t1"])
         t2 = float(levels["t2"])
         t3 = float(levels["t3"])
-
-        if not passes_target_quality(entry, t1, t2, t3):
-            return None
 
         state = setup_state(
             work,
